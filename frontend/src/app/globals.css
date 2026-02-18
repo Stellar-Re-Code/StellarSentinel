@@ -1,0 +1,36 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --stellar-blue: #3b5cf7;
+  --stellar-purple: #7c3aed;
+  --bg-dark: #0f0f23;
+  --bg-darker: #0a0a1a;
+  --card-bg: #1a1a2e;
+  --card-border: #2a2a4e;
+}
+
+body {
+  font-family: "Inter", system-ui, sans-serif;
+  background: var(--bg-darker);
+  color: #e2e8f0;
+}
+
+@layer components {
+  .btn-primary {
+    @apply bg-primary-600 hover:bg-primary-700 text-white font-semibold py-2 px-4 rounded-lg transition-all duration-200 shadow-lg shadow-primary-600/25;
+  }
+
+  .btn-secondary {
+    @apply bg-stellar-card hover:bg-stellar-border text-white font-semibold py-2 px-4 rounded-lg border border-stellar-border transition-all duration-200;
+  }
+
+  .card {
+    @apply bg-stellar-card border border-stellar-border rounded-xl p-6 shadow-xl;
+  }
+
+  .gradient-text {
+    @apply bg-gradient-to-r from-primary-400 to-purple-500 bg-clip-text text-transparent;
+  }
+}
