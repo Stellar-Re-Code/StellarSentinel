@@ -1,6 +1,6 @@
-# DevOps & Infrastructure Issues — StellarGuard 🚀
+# DevOps & Infrastructure Issues — StellarSentinel 🚀
 
-This document tracks all CI/CD, deployment, and infrastructure tasks for the StellarGuard platform.
+This document tracks all CI/CD, deployment, and infrastructure tasks for the StellarSentinel platform.
 
 ### 🛑 STRICT RULE FOR CONTRIBUTORS
 **When you complete an issue:**

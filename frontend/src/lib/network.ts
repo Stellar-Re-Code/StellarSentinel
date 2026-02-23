@@ -1,5 +1,5 @@
 /**
- * Network configuration for StellarGuard.
+ * Network configuration for StellarSentinel.
  *
  * TODO: [FE-4] Complete network configuration:
  * - Add Futurenet/Testnet/Mainnet configuration

@@ -1,6 +1,6 @@
-# Backend Issues — StellarGuard ⚙️
+# Backend Issues — StellarSentinel ⚙️
 
-This document tracks all backend API and infrastructure tasks for the StellarGuard platform.
+This document tracks all backend API and infrastructure tasks for the StellarSentinel platform.
 
 ### 🛑 STRICT RULE FOR CONTRIBUTORS
 **When you complete an issue:**

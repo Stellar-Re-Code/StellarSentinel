@@ -1,6 +1,6 @@
-# Smart Contract Issues — StellarGuard 🧠
+# Smart Contract Issues — StellarSentinel 🧠
 
-This document tracks all smart contract development tasks for the StellarGuard multi-sig treasury and DAO governance platform.
+This document tracks all smart contract development tasks for the StellarSentinel multi-sig treasury and DAO governance platform.
 
 ### 🛑 STRICT RULE FOR CONTRIBUTORS
 **When you complete an issue:**

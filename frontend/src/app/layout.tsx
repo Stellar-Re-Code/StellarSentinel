@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "StellarGuard — Decentralized Treasury Management",
+  title: "StellarSentinel — Decentralized Treasury Management",
   description:
     "Multi-signature treasury and DAO governance platform built on Stellar Soroban. Manage shared funds with configurable approval thresholds, proposal voting, and on-chain transparency.",
   keywords: [
@@ -37,7 +37,7 @@ export default function RootLayout({
             <div className="flex justify-between h-16 items-center">
               <div className="flex items-center space-x-3">
                 <span className="text-2xl font-bold gradient-text">
-                  🛡️ StellarGuard
+                  🛡️ StellarSentinel
                 </span>
               </div>
               <div className="hidden md:flex items-center space-x-8">

@@ -1,6 +1,6 @@
-# StellarGuard — Smart Contract Developer Guide
+# StellarSentinel — Smart Contract Developer Guide
 
-> A comprehensive guide to understanding, building, and testing the StellarGuard Soroban smart contracts.
+> A comprehensive guide to understanding, building, and testing the StellarSentinel Soroban smart contracts.
 
 ## Table of Contents
 1. [Architecture Overview](#architecture-overview)
@@ -15,18 +15,18 @@
 
 ## Architecture Overview
 
-StellarGuard consists of **four Soroban smart contracts** working together:
+StellarSentinel consists of **four Soroban smart contracts** working together:
 
 ```
-┌──────────────────────────────────────────────────────┐
-│                  StellarGuard System                  │
-├──────────────┬──────────────┬──────────────┬─────────┤
-│   Treasury   │  Governance  │  Token Vault │  Access │
-│              │              │              │ Control │
-│ - Multi-sig  │ - Proposals  │ - Locking    │ - Roles │
-│ - Deposits   │ - Voting     │ - Vesting    │ - RBAC  │
-│ - Withdrawals│ - Quorum     │ - Emergency  │ - Perms │
-└──────────────┴──────────────┴──────────────┴─────────┘
+┌──────────────────────────────────────────────────────────┐
+│                StellarSentinel System                    │
+├──────────────┬──────────────┬──────────────┬─────────────┤
+│   Treasury   │  Governance  │  Token Vault │   Access    │
+│              │              │              │  Control    │
+│ - Multi-sig  │ - Proposals  │ - Locking    │ - Roles     │
+│ - Deposits   │ - Voting     │ - Vesting    │ - RBAC      │
+│ - Withdrawals│ - Quorum     │ - Emergency  │ - Perms     │
+└──────────────┴──────────────┴──────────────┴─────────────┘
 ```
 
 ### Inter-Contract Communication
@@ -186,10 +186,10 @@ cd smartcontract
 cargo test --all
 
 # Run tests for a specific contract
-cargo test -p stellar-guard-treasury
-cargo test -p stellar-guard-governance
-cargo test -p stellar-guard-token-vault
-cargo test -p stellar-guard-access-control
+  cargo test -p stellar-sentinel-treasury
+  cargo test -p stellar-sentinel-governance
+  cargo test -p stellar-sentinel-token-vault
+  cargo test -p stellar-sentinel-access-control
 
 # Run with output
 cargo test --all -- --nocapture
@@ -212,7 +212,7 @@ soroban contract build
 
 # 4. Deploy each contract
 soroban contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/stellar_guard_treasury.wasm \
+  --wasm target/wasm32-unknown-unknown/release/stellar_sentinel_treasury.wasm \
   --source deployer \
   --network testnet
 

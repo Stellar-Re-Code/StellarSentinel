@@ -1,6 +1,6 @@
-# Frontend Issues — StellarGuard 🎨
+# Frontend Issues — StellarSentinel 🎨
 
-This document tracks all frontend development tasks for the StellarGuard dashboard.
+This document tracks all frontend development tasks for the StellarSentinel dashboard.
 
 ### 🛑 STRICT RULE FOR CONTRIBUTORS
 **When you complete an issue:**
@@ -17,7 +17,7 @@ This document tracks all frontend development tasks for the StellarGuard dashboa
 **Labels:** `frontend`, `config`, `good-first-issue`
 **Description:** Initialize Next.js app with correct styling and brand theme.
 - **Tasks:**
-  - [ ] Configure `tailwind.config.ts` with StellarGuard brand colors (primary blue, stellar purple, dark theme).
+  - [ ] Configure `tailwind.config.ts` with StellarSentinel brand colors (primary blue, stellar purple, dark theme).
   - [ ] Setup `globals.css` with CSS variables and custom utility classes (`.btn-primary`, `.btn-secondary`, `.card`, `.gradient-text`).
   - [ ] Create root `Layout` with glassmorphism navbar, navigation links (Dashboard, Treasury, Governance).
   - [ ] Add Inter and JetBrains Mono fonts.

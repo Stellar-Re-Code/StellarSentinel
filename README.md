@@ -1,13 +1,14 @@
-# StellarGuard
+# StellarSentinel
 
 A decentralized multi-signature treasury and DAO governance platform built on Stellar Soroban.
 
 ```
-  ____  _       _ _            ____                     _
- / ___|| |_ ___| | | __ _ _ __/ ___|_   _  __ _ _ __ __| |
- \___ \| __/ _ \ | |/ _` | '__| |  _| | | |/ _` | '__/ _` |
-  ___) | ||  __/ | | (_| | |  | |_| | |_| | (_| | | | (_| |
- |____/ \__\___|_|_|\__,_|_|   \____|\__,_|\__,_|_|  \__,_|
+   _____ _            ____            _   _            _   _           _   
+  / ____| |          / __ \___  _____| |_| |__   ___  | \ | | ___  ___| |_ 
+ | (___ | | _____  _| |  | \ \/ / __| __| '_ \ / _ \ |  \| |/ _ \/ __| __|
+  \___ \| |/ / _ \/ / |  | |>  < (__| |_| | | |  __/ | |\  |  __/\__ \ |_ 
+  ____) |   <  __/ | |__| /_/\_\___|\__|_| |_|\___| |_| \_|\___||___/\__|
+ |_____/|_|\_\___|_|\____/    /____/                                    
 ```
 
 > Trustless treasury management for teams, DAOs, and community organizations.
@@ -16,7 +17,7 @@ A decentralized multi-signature treasury and DAO governance platform built on St
 
 ## 💡 The Idea
 
-StellarGuard is a **sovereign, on-chain treasury management protocol** that enables:
+StellarSentinel is a **sovereign, on-chain treasury management protocol** that enables:
 
 - **Multi-Sig Fund Management**: Configurable approval thresholds for withdrawals (e.g., 3-of-5 signers)
 - **DAO Governance**: Create and vote on proposals for fund allocation, policy changes, and membership
@@ -26,7 +27,7 @@ StellarGuard is a **sovereign, on-chain treasury management protocol** that enab
 
 ### Why This Matters
 
-Many cooperatives, savings groups (ajo/esusu), and community organizations in emerging markets lack transparent treasury tools. StellarGuard provides trustless, on-chain fund management with Stellar's low fees and fast finality — no bank account required.
+Many cooperatives, savings groups (ajo/esusu), and community organizations in emerging markets lack transparent treasury tools. StellarSentinel provides trustless, on-chain fund management with Stellar's low fees and fast finality — no bank account required.
 
 ---
 
@@ -120,8 +121,8 @@ stellar/
 Clone the repository:
 
 ```bash
-git clone https://github.com/YourOrg/StellarGuard.git
-cd StellarGuard
+git clone https://github.com/Stellar-Re-Code/StellarSentinel.git
+cd StellarSentinel
 ```
 
 Verify workspace integrity:

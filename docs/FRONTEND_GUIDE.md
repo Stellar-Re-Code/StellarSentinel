@@ -1,6 +1,6 @@
-# StellarGuard — Frontend Developer Guide
+# StellarSentinel — Frontend Developer Guide
 
-> A guide to understanding, developing, and extending the StellarGuard Next.js dashboard.
+> A guide to understanding, developing, and extending the StellarSentinel Next.js dashboard.
 
 ## Table of Contents
 1. [Architecture](#architecture)

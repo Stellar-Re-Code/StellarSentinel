@@ -1,4 +1,4 @@
-# Maintainers — StellarGuard
+# Maintainers — StellarSentinel
 
 This document lists the project maintainers and their areas of responsibility.
 

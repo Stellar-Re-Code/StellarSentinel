@@ -6,7 +6,7 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        // StellarGuard brand
+        // StellarSentinel brand
         primary: {
           50: "#f0f4ff",
           100: "#dbe4fe",

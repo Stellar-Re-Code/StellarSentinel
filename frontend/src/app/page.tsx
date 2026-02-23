@@ -4,7 +4,7 @@ export default function Home() {
       {/* Hero Section */}
       <section className="text-center py-16">
         <h1 className="text-5xl font-bold gradient-text mb-4">
-          StellarGuard
+          StellarSentinel
         </h1>
         <p className="text-xl text-gray-400 max-w-2xl mx-auto mb-8">
           Decentralized multi-signature treasury and DAO governance.

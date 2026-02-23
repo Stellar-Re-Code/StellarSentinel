@@ -1,6 +1,6 @@
-# Style Guide — StellarGuard
+# Style Guide — StellarSentinel
 
-This document defines the coding standards for all contributions to the StellarGuard project.
+This document defines the coding standards for all contributions to the StellarSentinel project.
 
 ---
 

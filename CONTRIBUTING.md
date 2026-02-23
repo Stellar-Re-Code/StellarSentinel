@@ -1,4 +1,4 @@
-# Contributing to StellarGuard
+# Contributing to StellarSentinel
 
 Thank you for your interest in building trustless treasury management on Stellar! This guide will help you contribute effectively.
 
