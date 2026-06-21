@@ -777,4 +777,102 @@ mod test {
         let tx = client.get_transaction(&tx_id);
         assert_eq!(tx.executed, true);
     }
+
+    #[test]
+    #[should_panic(expected = "AlreadyInitialized")]
+    fn test_storage_lifecycle_already_initialized() {
+        let (env, admin, client) = setup_contract();
+        let signer = Address::generate(&env);
+        let signers = Vec::from_array(&env, [signer.clone()]);
+        
+        // First initialization
+        client.initialize(&admin, &1, &signers);
+        
+        // Second initialization should panic
+        client.initialize(&admin, &1, &signers);
+    }
+
+    #[test]
+    #[should_panic(expected = "NotInitialized")]
+    fn test_storage_lifecycle_not_initialized_deposit() {
+        let (env, _, client) = setup_contract();
+        let depositor = Address::generate(&env);
+        client.deposit(&depositor, &100);
+    }
+
+    #[test]
+    fn test_invariant_balance_tracking() {
+        let (env, admin, client) = setup_contract();
+        let signer1 = Address::generate(&env);
+        let signers = Vec::from_array(&env, [signer1.clone()]);
+        client.initialize(&admin, &1, &signers);
+
+        assert_eq!(client.get_balance(), 0);
+
+        let depositor = Address::generate(&env);
+        client.deposit(&depositor, &1_000);
+        assert_eq!(client.get_balance(), 1_000);
+
+        client.deposit(&depositor, &500);
+        assert_eq!(client.get_balance(), 1_500);
+
+        let recipient = Address::generate(&env);
+        let tx_id = client.propose_withdrawal(&signer1, &recipient, &500, &symbol_short!("pay"));
+        client.execute(&signer1, &tx_id);
+
+        assert_eq!(client.get_balance(), 1_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "InsufficientFunds")]
+    fn test_invariant_insufficient_funds_proposal() {
+        let (env, admin, client) = setup_contract();
+        let signer1 = Address::generate(&env);
+        let signers = Vec::from_array(&env, [signer1.clone()]);
+        client.initialize(&admin, &1, &signers);
+
+        let recipient = Address::generate(&env);
+        client.propose_withdrawal(&signer1, &recipient, &100, &symbol_short!("pay"));
+    }
+
+    #[test]
+    fn test_event_emission_coverage() {
+        let (env, admin, client) = setup_contract();
+        let signer1 = Address::generate(&env);
+        let signers = Vec::from_array(&env, [signer1.clone()]);
+        
+        client.initialize(&admin, &1, &signers);
+        
+        let events = env.events().all();
+        assert_eq!(events.len(), 1); // Initialization event
+
+        let depositor = Address::generate(&env);
+        client.deposit(&depositor, &500);
+        
+        let events = env.events().all();
+        assert_eq!(events.len(), 2); // Init + Deposit event
+        
+        let recipient = Address::generate(&env);
+        let tx_id = client.propose_withdrawal(&signer1, &recipient, &500, &symbol_short!("pay"));
+        
+        let events = env.events().all();
+        assert_eq!(events.len(), 3); // + Propose event
+
+        client.execute(&signer1, &tx_id);
+        
+        let events = env.events().all();
+        assert_eq!(events.len(), 4); // + Execute event
+    }
+
+    #[test]
+    #[should_panic(expected = "ThresholdBreach")]
+    fn test_invariant_threshold_breach_prevention() {
+        let (env, admin, client) = setup_contract();
+        let signer1 = Address::generate(&env);
+        let signers = Vec::from_array(&env, [signer1.clone()]);
+        client.initialize(&admin, &1, &signers);
+
+        // Cannot remove the only signer as it breaches the threshold
+        client.remove_signer(&admin, &signer1);
+    }
 }
