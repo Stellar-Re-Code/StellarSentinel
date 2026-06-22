@@ -39,6 +39,18 @@ pub enum Error {
     NotASigner = 11,
     /// Cannot remove signer — would breach threshold.
     ThresholdBreach = 12,
+    /// Transaction has expired.
+    TransactionExpired = 13,
+    /// Transaction has been canceled.
+    TransactionCanceled = 14,
+    /// Caller is not the proposer.
+    NotProposer = 15,
+    /// Signer has not approved this transaction.
+    NotApproved = 16,
+    /// Expiry timestamp is invalid.
+    InvalidExpiry = 17,
+    /// Transaction policy has been invalidated.
+    PolicyInvalidated = 18,
 }
 
 // ============================================================================
@@ -63,6 +75,8 @@ pub enum DataKey {
     TxCounter,
     /// Whether the contract is initialized.
     Initialized,
+    /// The current policy version for multi-sig.
+    PolicyVersion,
 }
 
 /// A pending transaction proposal in the multi-sig treasury.
@@ -85,6 +99,12 @@ pub struct Transaction {
     pub created_at: u64,
     /// Address that proposed the transaction.
     pub proposer: Address,
+    /// Timestamp when the transaction expires.
+    pub expires_at: u64,
+    /// Whether the transaction has been canceled.
+    pub canceled: bool,
+    /// The policy version under which this transaction is valid.
+    pub policy_version: u32,
 }
 
 /// Treasury configuration data.
@@ -101,6 +121,8 @@ pub struct TreasuryConfig {
     pub balance: i128,
     /// Total transactions proposed.
     pub tx_count: u64,
+    /// Current policy version.
+    pub policy_version: u32,
 }
 
 // ============================================================================
@@ -153,6 +175,7 @@ impl TreasuryContract {
         env.storage().instance().set(&DataKey::Signers, &signers);
         env.storage().instance().set(&DataKey::Balance, &0_i128);
         env.storage().instance().set(&DataKey::TxCounter, &0_u64);
+        env.storage().instance().set(&DataKey::PolicyVersion, &1_u32);
 
         // Emit initialization event
         env.events().publish(
@@ -221,6 +244,7 @@ impl TreasuryContract {
     /// * `to` - The destination address.
     /// * `amount` - The amount to withdraw.
     /// * `memo` - A short description of the withdrawal.
+    /// * `expires_at` - Timestamp when the transaction expires.
     ///
     /// # Returns
     /// The ID of the created transaction proposal.
@@ -230,12 +254,14 @@ impl TreasuryContract {
     /// * `Error::NotASigner` - If the proposer is not an authorized signer.
     /// * `Error::InvalidAmount` - If the amount is zero or negative.
     /// * `Error::InsufficientFunds` - If treasury balance is less than amount.
+    /// * `Error::InvalidExpiry` - If expiry is in the past.
     pub fn propose_withdrawal(
         env: Env,
         proposer: Address,
         to: Address,
         amount: i128,
         memo: Symbol,
+        expires_at: u64,
     ) -> Result<u64, Error> {
         Self::require_initialized(&env)?;
         Self::require_signer(&env, &proposer)?;
@@ -244,6 +270,10 @@ impl TreasuryContract {
 
         if amount <= 0 {
             return Err(Error::InvalidAmount);
+        }
+
+        if expires_at <= env.ledger().timestamp() {
+            return Err(Error::InvalidExpiry);
         }
 
         // Check sufficient balance
@@ -281,6 +311,9 @@ impl TreasuryContract {
             executed: false,
             created_at: env.ledger().timestamp(),
             proposer: proposer.clone(),
+            expires_at,
+            canceled: false,
+            policy_version: env.storage().instance().get(&DataKey::PolicyVersion).unwrap_or(1),
         };
 
         // Store transaction
@@ -330,6 +363,16 @@ impl TreasuryContract {
 
         if transaction.executed {
             return Err(Error::AlreadyExecuted);
+        }
+        if transaction.canceled {
+            return Err(Error::TransactionCanceled);
+        }
+        if env.ledger().timestamp() > transaction.expires_at {
+            return Err(Error::TransactionExpired);
+        }
+        let current_policy_version: u32 = env.storage().instance().get(&DataKey::PolicyVersion).unwrap_or(1);
+        if transaction.policy_version != current_policy_version {
+            return Err(Error::PolicyInvalidated);
         }
 
         // Check if already approved by this signer
@@ -386,6 +429,16 @@ impl TreasuryContract {
         if transaction.executed {
             return Err(Error::AlreadyExecuted);
         }
+        if transaction.canceled {
+            return Err(Error::TransactionCanceled);
+        }
+        if env.ledger().timestamp() > transaction.expires_at {
+            return Err(Error::TransactionExpired);
+        }
+        let current_policy_version: u32 = env.storage().instance().get(&DataKey::PolicyVersion).unwrap_or(1);
+        if transaction.policy_version != current_policy_version {
+            return Err(Error::PolicyInvalidated);
+        }
 
         // Check threshold
         let threshold: u32 = env
@@ -427,6 +480,103 @@ impl TreasuryContract {
         Ok(())
     }
 
+    /// Revoke a previous approval for a transaction.
+    /// Can only be done before execution.
+    pub fn revoke_approval(env: Env, signer: Address, tx_id: u64) -> Result<u32, Error> {
+        Self::require_initialized(&env)?;
+        Self::require_signer(&env, &signer)?;
+
+        signer.require_auth();
+
+        let mut transaction: Transaction = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Transaction(tx_id))
+            .ok_or(Error::TransactionNotFound)?;
+
+        if transaction.executed {
+            return Err(Error::AlreadyExecuted);
+        }
+        if transaction.canceled {
+            return Err(Error::TransactionCanceled);
+        }
+        if env.ledger().timestamp() > transaction.expires_at {
+            return Err(Error::TransactionExpired);
+        }
+        let current_policy_version: u32 = env.storage().instance().get(&DataKey::PolicyVersion).unwrap_or(1);
+        if transaction.policy_version != current_policy_version {
+            return Err(Error::PolicyInvalidated);
+        }
+
+        let mut new_approvals = Vec::new(&env);
+        let mut found = false;
+        for i in 0..transaction.approvals.len() {
+            let s = transaction.approvals.get(i).unwrap();
+            if s == signer {
+                found = true;
+            } else {
+                new_approvals.push_back(s);
+            }
+        }
+
+        if !found {
+            return Err(Error::NotApproved);
+        }
+
+        transaction.approvals = new_approvals;
+        let approval_count = transaction.approvals.len();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Transaction(tx_id), &transaction);
+
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("revoke")),
+            (tx_id, signer.clone(), approval_count),
+        );
+
+        log!(&env, "Transaction #{} approval revoked by {:?}", tx_id, signer);
+        Ok(approval_count)
+    }
+
+    /// Cancel a transaction. Only the proposer or the admin can cancel.
+    pub fn cancel_withdrawal(env: Env, caller: Address, tx_id: u64) -> Result<(), Error> {
+        Self::require_initialized(&env)?;
+        caller.require_auth();
+
+        let mut transaction: Transaction = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Transaction(tx_id))
+            .ok_or(Error::TransactionNotFound)?;
+
+        if transaction.executed {
+            return Err(Error::AlreadyExecuted);
+        }
+        if transaction.canceled {
+            return Err(Error::TransactionCanceled);
+        }
+
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != transaction.proposer && caller != admin {
+            return Err(Error::Unauthorized);
+        }
+
+        transaction.canceled = true;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Transaction(tx_id), &transaction);
+
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("cancel")),
+            (tx_id, caller.clone()),
+        );
+
+        log!(&env, "Transaction #{} canceled by {:?}", tx_id, caller);
+        Ok(())
+    }
+
     // ========================================================================
     // Signer Management
     // ========================================================================
@@ -454,6 +604,10 @@ impl TreasuryContract {
 
         signers.push_back(new_signer.clone());
         env.storage().instance().set(&DataKey::Signers, &signers);
+
+        let mut policy_version: u32 = env.storage().instance().get(&DataKey::PolicyVersion).unwrap_or(1);
+        policy_version += 1;
+        env.storage().instance().set(&DataKey::PolicyVersion, &policy_version);
 
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("add_sig")),
@@ -508,6 +662,10 @@ impl TreasuryContract {
             .instance()
             .set(&DataKey::Signers, &new_signers);
 
+        let mut policy_version: u32 = env.storage().instance().get(&DataKey::PolicyVersion).unwrap_or(1);
+        policy_version += 1;
+        env.storage().instance().set(&DataKey::PolicyVersion, &policy_version);
+
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("rem_sig")),
             (signer.clone(), new_signers.len()),
@@ -537,6 +695,10 @@ impl TreasuryContract {
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &new_threshold);
+
+        let mut policy_version: u32 = env.storage().instance().get(&DataKey::PolicyVersion).unwrap_or(1);
+        policy_version += 1;
+        env.storage().instance().set(&DataKey::PolicyVersion, &policy_version);
 
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("thresh")),
@@ -587,6 +749,11 @@ impl TreasuryContract {
             .instance()
             .get(&DataKey::TxCounter)
             .unwrap_or(0);
+        let policy_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PolicyVersion)
+            .unwrap_or(1);
 
         Ok(TreasuryConfig {
             admin,
@@ -594,6 +761,7 @@ impl TreasuryContract {
             signer_count: signers.len(),
             balance,
             tx_count,
+            policy_version,
         })
     }
 
@@ -699,7 +867,7 @@ mod test {
     fn setup_contract() -> (Env, Address, TreasuryContractClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(TreasuryContract, ());
+        let contract_id = env.register_contract(None, crate::TreasuryContract);
         let client = TreasuryContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         (env, admin, client)
@@ -760,6 +928,7 @@ mod test {
             &recipient,
             &1_000_000,
             &symbol_short!("rent"),
+            &(env.ledger().timestamp() + 3600),
         );
         assert_eq!(tx_id, 1);
 
