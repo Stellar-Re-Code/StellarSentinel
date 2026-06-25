@@ -51,6 +51,8 @@ pub enum Error {
     InvalidExpiry = 17,
     /// Transaction policy has been invalidated.
     PolicyInvalidated = 18,
+    /// Duplicate signer in initialization or addition.
+    DuplicateSigner = 19,
 }
 
 // ============================================================================
@@ -63,6 +65,8 @@ pub enum Error {
 pub enum DataKey {
     /// The admin address that initialized the contract.
     Admin,
+    /// The immutable asset address bound to this treasury.
+    Asset,
     /// The approval threshold for multi-sig.
     Threshold,
     /// List of authorized signers.
@@ -113,6 +117,8 @@ pub struct Transaction {
 pub struct TreasuryConfig {
     /// Admin address.
     pub admin: Address,
+    /// Asset address.
+    pub asset: Address,
     /// Required approval threshold.
     pub threshold: u32,
     /// Number of signers.
@@ -143,15 +149,18 @@ impl TreasuryContract {
     /// # Arguments
     /// * `env` - The contract environment.
     /// * `admin` - The address that will administer the treasury.
+    /// * `asset` - The Stellar Asset Contract address bound to this treasury.
     /// * `threshold` - The number of approvals required for withdrawals.
     /// * `signers` - Initial list of authorized signers.
     ///
     /// # Errors
     /// * `Error::AlreadyInitialized` - If the contract was already initialized.
     /// * `Error::InvalidThreshold` - If threshold is 0 or exceeds signer count.
+    /// * `Error::DuplicateSigner` - If `signers` contains duplicate addresses.
     pub fn initialize(
         env: Env,
         admin: Address,
+        asset: Address,
         threshold: u32,
         signers: Vec<Address>,
     ) -> Result<(), Error> {
@@ -160,8 +169,17 @@ impl TreasuryContract {
             return Err(Error::AlreadyInitialized);
         }
 
-        // Validate threshold
-        let signer_count = signers.len();
+        // Validate unique signers
+        let mut unique_signers = Vec::new(&env);
+        for s in signers.iter() {
+            if unique_signers.contains(s.clone()) {
+                return Err(Error::DuplicateSigner);
+            }
+            unique_signers.push_back(s.clone());
+        }
+
+        // Validate threshold against unique signers
+        let signer_count = unique_signers.len();
         if threshold == 0 || threshold > signer_count {
             return Err(Error::InvalidThreshold);
         }
@@ -171,8 +189,9 @@ impl TreasuryContract {
         // Store all initial state
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Asset, &asset);
         env.storage().instance().set(&DataKey::Threshold, &threshold);
-        env.storage().instance().set(&DataKey::Signers, &signers);
+        env.storage().instance().set(&DataKey::Signers, &unique_signers);
         env.storage().instance().set(&DataKey::Balance, &0_i128);
         env.storage().instance().set(&DataKey::TxCounter, &0_u64);
         env.storage().instance().set(&DataKey::PolicyVersion, &1_u32);
@@ -180,10 +199,10 @@ impl TreasuryContract {
         // Emit initialization event
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("init")),
-            (admin.clone(), threshold, signer_count),
+            (admin.clone(), asset.clone(), threshold, signer_count),
         );
 
-        log!(&env, "Treasury initialized with {} signers, threshold {}", signer_count, threshold);
+        log!(&env, "Treasury initialized with {} signers, threshold {}, asset {:?}", signer_count, threshold, asset);
         Ok(())
     }
 
@@ -729,6 +748,11 @@ impl TreasuryContract {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)?;
+        let asset: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Asset)
+            .ok_or(Error::NotInitialized)?;
         let threshold: u32 = env
             .storage()
             .instance()
@@ -757,6 +781,7 @@ impl TreasuryContract {
 
         Ok(TreasuryConfig {
             admin,
+            asset,
             threshold,
             signer_count: signers.len(),
             balance,
@@ -860,6 +885,7 @@ impl TreasuryContract {
 
 #[cfg(test)]
 mod test {
+    use soroban_sdk::testutils::Events;
     use super::*;
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::Env;
@@ -881,15 +907,18 @@ mod test {
         let signer2 = Address::generate(&env);
         let signer3 = Address::generate(&env);
 
+        let asset = Address::generate(&env);
+
         let signers = Vec::from_array(
             &env,
             [signer1.clone(), signer2.clone(), signer3.clone()],
         );
 
-        client.initialize(&admin, &2, &signers);
+        client.initialize(&admin, &asset, &2, &signers);
 
         let config = client.get_config();
         assert_eq!(config.admin, admin);
+        assert_eq!(config.asset, asset);
         assert_eq!(config.threshold, 2);
         assert_eq!(config.signer_count, 3);
         assert_eq!(config.balance, 0);
@@ -900,8 +929,9 @@ mod test {
         let (env, admin, client) = setup_contract();
 
         let signer1 = Address::generate(&env);
+        let asset = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
-        client.initialize(&admin, &1, &signers);
+        client.initialize(&admin, &asset, &1, &signers);
 
         let depositor = Address::generate(&env);
         client.deposit(&depositor, &1_000_000);
@@ -915,8 +945,9 @@ mod test {
 
         let signer1 = Address::generate(&env);
         let signer2 = Address::generate(&env);
+        let asset = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone(), signer2.clone()]);
-        client.initialize(&admin, &2, &signers);
+        client.initialize(&admin, &asset, &2, &signers);
 
         // Deposit some funds
         client.deposit(&signer1, &5_000_000);
@@ -948,21 +979,54 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "AlreadyInitialized")]
-    fn test_storage_lifecycle_already_initialized() {
+    #[should_panic(expected = "HostError: Error(Contract, #19)")]
+    fn test_duplicate_signer_rejected() {
         let (env, admin, client) = setup_contract();
-        let signer = Address::generate(&env);
-        let signers = Vec::from_array(&env, [signer.clone()]);
+        let signer1 = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let signers = Vec::from_array(&env, [signer1.clone(), signer1.clone()]);
         
-        // First initialization
-        client.initialize(&admin, &1, &signers);
-        
-        // Second initialization should panic
-        client.initialize(&admin, &1, &signers);
+        client.initialize(&admin, &asset, &1, &signers);
     }
 
     #[test]
-    #[should_panic(expected = "NotInitialized")]
+    #[should_panic(expected = "HostError: Error(Contract, #2)")]
+    fn test_already_initialized() {
+        let (env, admin, client) = setup_contract();
+        let signer1 = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let signers = Vec::from_array(&env, [signer1.clone()]);
+        
+        client.initialize(&admin, &asset, &1, &signers);
+        // Attempt re-initialization
+        let new_asset = Address::generate(&env);
+        client.initialize(&admin, &new_asset, &1, &signers);
+    }
+
+    #[test]
+    #[should_panic(expected = "HostError: Error(Contract, #6)")]
+    fn test_invalid_threshold_zero() {
+        let (env, admin, client) = setup_contract();
+        let signer1 = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let signers = Vec::from_array(&env, [signer1.clone()]);
+        
+        client.initialize(&admin, &asset, &0, &signers);
+    }
+
+    #[test]
+    #[should_panic(expected = "HostError: Error(Contract, #6)")]
+    fn test_invalid_threshold_exceeds_signers() {
+        let (env, admin, client) = setup_contract();
+        let signer1 = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let signers = Vec::from_array(&env, [signer1.clone()]);
+        
+        client.initialize(&admin, &asset, &2, &signers);
+    }
+
+    #[test]
+    #[should_panic(expected = "HostError: Error(Contract, #1)")]
     fn test_storage_lifecycle_not_initialized_deposit() {
         let (env, _, client) = setup_contract();
         let depositor = Address::generate(&env);
@@ -973,8 +1037,9 @@ mod test {
     fn test_invariant_balance_tracking() {
         let (env, admin, client) = setup_contract();
         let signer1 = Address::generate(&env);
+        let asset = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
-        client.initialize(&admin, &1, &signers);
+        client.initialize(&admin, &asset, &1, &signers);
 
         assert_eq!(client.get_balance(), 0);
 
@@ -986,31 +1051,33 @@ mod test {
         assert_eq!(client.get_balance(), 1_500);
 
         let recipient = Address::generate(&env);
-        let tx_id = client.propose_withdrawal(&signer1, &recipient, &500, &symbol_short!("pay"));
+        let tx_id = client.propose_withdrawal(&signer1, &recipient, &500, &symbol_short!("pay"), &2000);
         client.execute(&signer1, &tx_id);
 
         assert_eq!(client.get_balance(), 1_000);
     }
 
     #[test]
-    #[should_panic(expected = "InsufficientFunds")]
+    #[should_panic(expected = "HostError: Error(Contract, #5)")]
     fn test_invariant_insufficient_funds_proposal() {
         let (env, admin, client) = setup_contract();
         let signer1 = Address::generate(&env);
+        let asset = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
-        client.initialize(&admin, &1, &signers);
+        client.initialize(&admin, &asset, &1, &signers);
 
         let recipient = Address::generate(&env);
-        client.propose_withdrawal(&signer1, &recipient, &100, &symbol_short!("pay"));
+        client.propose_withdrawal(&signer1, &recipient, &100, &symbol_short!("pay"), &2000);
     }
 
     #[test]
     fn test_event_emission_coverage() {
         let (env, admin, client) = setup_contract();
         let signer1 = Address::generate(&env);
+        let asset = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
         
-        client.initialize(&admin, &1, &signers);
+        client.initialize(&admin, &asset, &1, &signers);
         
         let events = env.events().all();
         assert_eq!(events.len(), 1); // Initialization event
@@ -1022,7 +1089,7 @@ mod test {
         assert_eq!(events.len(), 2); // Init + Deposit event
         
         let recipient = Address::generate(&env);
-        let tx_id = client.propose_withdrawal(&signer1, &recipient, &500, &symbol_short!("pay"));
+        let tx_id = client.propose_withdrawal(&signer1, &recipient, &500, &symbol_short!("pay"), &2000);
         
         let events = env.events().all();
         assert_eq!(events.len(), 3); // + Propose event
@@ -1034,12 +1101,13 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "ThresholdBreach")]
+    #[should_panic(expected = "HostError: Error(Contract, #12)")]
     fn test_invariant_threshold_breach_prevention() {
         let (env, admin, client) = setup_contract();
         let signer1 = Address::generate(&env);
+        let asset = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
-        client.initialize(&admin, &1, &signers);
+        client.initialize(&admin, &asset, &1, &signers);
 
         // Cannot remove the only signer as it breaches the threshold
         client.remove_signer(&admin, &signer1);

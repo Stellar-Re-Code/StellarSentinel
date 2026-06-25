@@ -721,7 +721,7 @@ mod test {
     fn setup_contract() -> (Env, Address, TokenVaultContractClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(TokenVaultContract, ());
+        let contract_id = env.register_contract(None, TokenVaultContract);
         let client = TokenVaultContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         (env, admin, client)

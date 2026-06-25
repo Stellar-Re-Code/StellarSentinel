@@ -40,7 +40,7 @@ pub enum Error {
 /// Role levels in the access control hierarchy.
 /// Higher values = more permissions.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Role {
     /// Can only view data, no write operations.
@@ -607,7 +607,7 @@ mod test {
     fn setup_contract() -> (Env, Address, AccessControlContractClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(AccessControlContract, ());
+        let contract_id = env.register_contract(None, AccessControlContract);
         let client = AccessControlContractClient::new(&env, &contract_id);
         let owner = Address::generate(&env);
         (env, owner, client)
