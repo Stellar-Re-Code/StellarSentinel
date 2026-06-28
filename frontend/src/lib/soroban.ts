@@ -1,23 +1,21 @@
-/**
- * Soroban contract interaction helpers.
- *
- * TODO: [FE-12] [FE-19] Complete this file with:
- * - Soroban RPC server connection
- * - Contract client initialization
- * - Transaction building helpers
- * - XDR encoding/decoding utilities
- */
+import { 
+  Contract, 
+  SorobanRpc, 
+  TransactionBuilder, 
+  Networks, 
+  xdr, 
+  Address,
+  nativeToScVal
+} from "@stellar/stellar-sdk";
+import { signTransaction } from "@stellar/freighter-api";
+import { SOROBAN_RPC_URL, NETWORK_PASSPHRASE } from "./network";
 
 // ============================================================================
 // Contract IDs
 // ============================================================================
 
-// TODO: Replace with actual deployed contract IDs
 export const CONTRACT_IDS = {
-  treasury: "PLACEHOLDER_TREASURY_CONTRACT_ID",
-  governance: "PLACEHOLDER_GOVERNANCE_CONTRACT_ID",
-  tokenVault: "PLACEHOLDER_TOKEN_VAULT_CONTRACT_ID",
-  accessControl: "PLACEHOLDER_ACCESS_CONTROL_CONTRACT_ID",
+  treasury: process.env.NEXT_PUBLIC_TREASURY_CONTRACT_ID || "CD2M7R6E55D36VTR2C5BIPNGB6W6KUX5IAJTGKIN2ER7LBNVKOCCWAAA", // Example testnet ID
 } as const;
 
 // ============================================================================
@@ -25,76 +23,109 @@ export const CONTRACT_IDS = {
 // ============================================================================
 
 /**
+ * Get a Soroban RPC server instance.
+ */
+export function getRpcServer(): SorobanRpc.Server {
+  return new SorobanRpc.Server(SOROBAN_RPC_URL);
+}
+
+/**
  * Build a Soroban contract invocation transaction.
- *
- * TODO: Implement with @stellar/stellar-sdk:
- * - Create TransactionBuilder
- * - Add contract invocation operation
- * - Simulate transaction for resource estimation
- * - Return assembled transaction for signing
  */
 export async function buildContractCall(
   contractId: string,
   method: string,
   args: any[],
   sourceAddress: string
-): Promise<any> {
-  // TODO: Implementation
-  // import { Contract, SorobanRpc, TransactionBuilder, Networks } from "@stellar/stellar-sdk";
-  //
-  // const server = new SorobanRpc.Server(SOROBAN_RPC_URL);
-  // const account = await server.getAccount(sourceAddress);
-  // const contract = new Contract(contractId);
-  //
-  // const tx = new TransactionBuilder(account, {
-  //   fee: "100",
-  //   networkPassphrase: Networks.TESTNET,
-  // })
-  //   .addOperation(contract.call(method, ...args))
-  //   .setTimeout(30)
-  //   .build();
-  //
-  // const simulated = await server.simulateTransaction(tx);
-  // return SorobanRpc.assembleTransaction(tx, simulated).build();
+): Promise<string> {
+  const server = getRpcServer();
+  const account = await server.getAccount(sourceAddress);
+  const contract = new Contract(contractId);
 
-  throw new Error("Contract call building not implemented yet");
+  const tx = new TransactionBuilder(account, {
+    fee: "100",
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(contract.call(method, ...args))
+    .setTimeout(30)
+    .build();
+
+  const simulated = await server.simulateTransaction(tx);
+  if (SorobanRpc.Api.isSimulationError(simulated)) {
+    throw new Error(`Simulation failed: ${simulated.error}`);
+  }
+  
+  const assembledTx = SorobanRpc.assembleTransaction(tx, simulated) as any;
+  return assembledTx.toXDR();
 }
 
 /**
  * Sign a transaction using Freighter wallet and submit to network.
- *
- * TODO: Implement with @stellar/freighter-api:
- * - Sign transaction XDR
- * - Submit to Soroban RPC
- * - Wait for confirmation
- * - Return result
  */
-export async function signAndSubmit(transaction: any): Promise<any> {
-  // TODO: Implementation
-  // import { signTransaction } from "@stellar/freighter-api";
-  //
-  // const signedXDR = await signTransaction(transaction.toXDR(), {
-  //   networkPassphrase: Networks.TESTNET,
-  // });
-  //
-  // const server = new SorobanRpc.Server(SOROBAN_RPC_URL);
-  // const tx = TransactionBuilder.fromXDR(signedXDR, Networks.TESTNET);
-  // const result = await server.sendTransaction(tx);
-  // return result;
+export async function signAndSubmit(
+  xdrString: string,
+  userAddress: string
+): Promise<string> {
+  const signedXDR = await signTransaction(xdrString, {
+    networkPassphrase: NETWORK_PASSPHRASE,
+  });
 
-  throw new Error("Sign and submit not implemented yet");
+  const server = getRpcServer();
+  const tx = TransactionBuilder.fromXDR(signedXDR, NETWORK_PASSPHRASE);
+  
+  const sendResponse = await server.sendTransaction(tx);
+  if (sendResponse.status === "ERROR") {
+    throw new Error(`Transaction sending failed: ${JSON.stringify(sendResponse.errorResult)}`);
+  }
+
+  // Poll for transaction result
+  let txHash = sendResponse.hash;
+  let attempts = 0;
+  while (attempts < 10) {
+    const statusResponse = await server.getTransaction(txHash);
+    if (statusResponse.status === "SUCCESS") {
+      return txHash;
+    } else if (statusResponse.status === "FAILED") {
+      throw new Error(`Transaction execution failed: ${JSON.stringify(statusResponse.resultXdr)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    attempts++;
+  }
+  
+  throw new Error("Transaction confirmation timed out");
 }
 
 /**
  * Read a value from a Soroban contract (no signing required).
- *
- * TODO: Implement contract state reading with simulateTransaction
  */
 export async function readContractValue(
   contractId: string,
   method: string,
   args: any[] = []
 ): Promise<any> {
-  // TODO: Implementation using simulateTransaction for read-only calls
-  throw new Error("Contract reading not implemented yet");
+  const server = getRpcServer();
+  const contract = new Contract(contractId);
+  
+  // Use a dummy source address for simulation
+  const dummySource = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
+  const account = await server.getAccount(dummySource);
+  
+  const tx = new TransactionBuilder(account, {
+    fee: "100",
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(contract.call(method, ...args))
+    .setTimeout(30)
+    .build();
+
+  const simulated = await server.simulateTransaction(tx);
+  if (SorobanRpc.Api.isSimulationError(simulated)) {
+    throw new Error(`Simulation failed: ${simulated.error}`);
+  }
+
+  if (simulated.result) {
+    // Return parsed result if available
+    return simulated.result.retval;
+  }
+  return null;
 }
