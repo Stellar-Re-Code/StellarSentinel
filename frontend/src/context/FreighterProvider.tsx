@@ -8,28 +8,41 @@ import {
   useCallback,
   ReactNode,
 } from "react";
+import * as freighter from "@stellar/freighter-api";
 
 // ============================================================================
 // Types
 // ============================================================================
 
+export interface MockSigner {
+  name: string;
+  address: string;
+  isSigner: boolean;
+}
+
+export const MOCK_SIGNERS: MockSigner[] = [
+  { name: "Signer A (Owner)", address: "GA3DFA75C2RYNXE2T33FIPNGB6W6KUX5IAJTGKIN2ER7LBNVKOCCWAAA", isSigner: true },
+  { name: "Signer B (Co-Signer)", address: "GB3KJPLGUZMRM3SBNI644UGB6N4T3PZEXQLEJNX24K4YBNMQTRQL6BQA", isSigner: true },
+  { name: "Signer C (Co-Signer)", address: "GDK2T5T7W4H4H4H4H4H4H4H4H4H4H4H4H4H4H4H4H4H4H4H4H4H4H4H4", isSigner: true },
+  { name: "Executor (Non-Signer)", address: "GD7V6M6Y3A33K33K33K33K33K33K33K33K33K33K33K33K33K33K33K3", isSigner: false },
+];
+
 interface FreighterContextType {
-  /** The connected wallet address, or null if not connected. */
   address: string | null;
-  /** The current network (TESTNET, PUBLIC, FUTURENET). */
   network: string | null;
-  /** Whether the wallet is currently connecting. */
   isConnecting: boolean;
-  /** Whether the wallet is connected. */
   isConnected: boolean;
-  /** Whether Freighter extension is installed. */
   isFreighterInstalled: boolean;
-  /** Connect to the Freighter wallet. */
   connect: () => Promise<void>;
-  /** Disconnect the wallet. */
   disconnect: () => void;
-  /** Last error message, if any. */
   error: string | null;
+  
+  // Mock Mode Extensions for testing E2E multisig
+  isMockMode: boolean;
+  toggleMockMode: (enabled: boolean) => void;
+  mockSigners: MockSigner[];
+  activeMockSigner: MockSigner | null;
+  selectMockSigner: (address: string) => void;
 }
 
 // ============================================================================
@@ -45,16 +58,15 @@ const FreighterContext = createContext<FreighterContextType>({
   connect: async () => {},
   disconnect: () => {},
   error: null,
+  isMockMode: true,
+  toggleMockMode: () => {},
+  mockSigners: [],
+  activeMockSigner: null,
+  selectMockSigner: () => {},
 });
 
 // ============================================================================
 // Provider Component
-//
-// TODO: [FE-2] Complete Freighter integration:
-//   - Import @stellar/freighter-api
-//   - Implement real checkConnection on mount
-//   - Implement real connectWallet function
-//   - Handle network switching events
 // ============================================================================
 
 export function FreighterProvider({ children }: { children: ReactNode }) {
@@ -64,23 +76,40 @@ export function FreighterProvider({ children }: { children: ReactNode }) {
   const [isFreighterInstalled, setIsFreighterInstalled] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Mock Mode state
+  const [isMockMode, setIsMockModeState] = useState<boolean>(true);
+  const [activeMockSigner, setActiveMockSigner] = useState<MockSigner | null>(MOCK_SIGNERS[0]);
+
   // Check if Freighter is installed on mount
   useEffect(() => {
     const checkFreighter = async () => {
       try {
-        // TODO: Replace with actual Freighter API check
-        // import { isConnected as checkInstalled } from "@stellar/freighter-api";
-        // const installed = await checkInstalled();
-        const installed = typeof window !== "undefined" && !!(window as any).freighter;
-        setIsFreighterInstalled(installed);
-
+        const installed = await freighter.isConnected();
+        setIsFreighterInstalled(!!installed);
+        
+        // Auto-detect: if Freighter is installed, default to live mode
         if (installed) {
-          // TODO: Auto-reconnect if previously connected
-          // const { isConnected } = await isConnected();
-          // if (isConnected) { ... }
+          setIsMockModeState(false);
+          try {
+            const publicKey = await freighter.getPublicKey();
+            const net = await freighter.getNetwork();
+            if (publicKey) setAddress(publicKey);
+            if (net) setNetwork(net);
+          } catch (e) {
+            console.warn("Freighter not authorized yet:", e);
+          }
+        } else {
+          // If no Freighter, default to mock mode
+          setIsMockModeState(true);
+          setAddress(MOCK_SIGNERS[0].address);
+          setNetwork("TESTNET");
         }
       } catch (err) {
         console.error("Failed to check Freighter:", err);
+        // Fallback to mock mode safely
+        setIsMockModeState(true);
+        setAddress(MOCK_SIGNERS[0].address);
+        setNetwork("TESTNET");
       }
     };
 
@@ -91,33 +120,63 @@ export function FreighterProvider({ children }: { children: ReactNode }) {
     setIsConnecting(true);
     setError(null);
 
-    try {
-      // TODO: [FE-2] Replace with actual Freighter connection:
-      // import { requestAccess, getAddress, getNetwork } from "@stellar/freighter-api";
-      // const accessResponse = await requestAccess();
-      // if (accessResponse.error) throw new Error(accessResponse.error);
-      // const addressResponse = await getAddress();
-      // const networkResponse = await getNetwork();
-      // setAddress(addressResponse.address);
-      // setNetwork(networkResponse.network);
+    if (isMockMode) {
+      // Mock wallet connection
+      setTimeout(() => {
+        if (activeMockSigner) {
+          setAddress(activeMockSigner.address);
+        } else {
+          setAddress(MOCK_SIGNERS[0].address);
+          setActiveMockSigner(MOCK_SIGNERS[0]);
+        }
+        setNetwork("TESTNET");
+        setIsConnecting(false);
+      }, 500);
+      return;
+    }
 
-      // Placeholder for development
-      throw new Error(
-        "Freighter wallet not integrated yet. See issue FE-2."
-      );
+    try {
+      const publicKey = await freighter.requestAccess();
+      if (!publicKey) throw new Error("Access denied by user");
+      
+      const net = await freighter.getNetwork();
+
+      setAddress(publicKey);
+      setNetwork(net);
     } catch (err: any) {
       setError(err.message || "Failed to connect wallet");
       console.error("Wallet connection failed:", err);
     } finally {
       setIsConnecting(false);
     }
-  }, []);
+  }, [isMockMode, activeMockSigner]);
 
   const disconnect = useCallback(() => {
     setAddress(null);
     setNetwork(null);
     setError(null);
   }, []);
+
+  const toggleMockMode = useCallback((enabled: boolean) => {
+    setIsMockModeState(enabled);
+    if (enabled) {
+      const signer = activeMockSigner || MOCK_SIGNERS[0];
+      setAddress(signer.address);
+      setActiveMockSigner(signer);
+      setNetwork("TESTNET");
+    } else {
+      setAddress(null);
+      setNetwork(null);
+    }
+  }, [activeMockSigner]);
+
+  const selectMockSigner = useCallback((addr: string) => {
+    const signer = MOCK_SIGNERS.find((s) => s.address === addr) || MOCK_SIGNERS[0];
+    setActiveMockSigner(signer);
+    if (isMockMode) {
+      setAddress(signer.address);
+    }
+  }, [isMockMode]);
 
   return (
     <FreighterContext.Provider
@@ -130,16 +189,17 @@ export function FreighterProvider({ children }: { children: ReactNode }) {
         connect,
         disconnect,
         error,
+        isMockMode,
+        toggleMockMode,
+        mockSigners: MOCK_SIGNERS,
+        activeMockSigner,
+        selectMockSigner,
       }}
     >
       {children}
     </FreighterContext.Provider>
   );
 }
-
-// ============================================================================
-// Hook
-// ============================================================================
 
 export function useFreighter() {
   const context = useContext(FreighterContext);

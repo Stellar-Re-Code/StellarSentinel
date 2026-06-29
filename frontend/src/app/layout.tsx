@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { FreighterProvider } from "@/context/FreighterProvider";
+import { WalletConnect } from "@/components/WalletConnect";
 
 export const metadata: Metadata = {
   title: "StellarSentinel — Decentralized Treasury Management",
@@ -31,44 +33,45 @@ export default function RootLayout({
         />
       </head>
       <body className="min-h-screen bg-stellar-darker">
-        {/* TODO: [FE-2] Wrap with FreighterProvider */}
-        <nav className="border-b border-stellar-border bg-stellar-dark/80 backdrop-blur-sm sticky top-0 z-50">
-          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div className="flex justify-between h-16 items-center">
-              <div className="flex items-center space-x-3">
-                <span className="text-2xl font-bold gradient-text">
-                  🛡️ StellarSentinel
-                </span>
+        <FreighterProvider>
+          <nav className="border-b border-stellar-border bg-stellar-dark/80 backdrop-blur-sm sticky top-0 z-50">
+            <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+              <div className="flex justify-between h-16 items-center">
+                <div className="flex items-center space-x-3">
+                  <a href="/" className="text-2xl font-bold gradient-text">
+                    🛡️ StellarSentinel
+                  </a>
+                </div>
+                <div className="hidden md:flex items-center space-x-8">
+                  <a
+                    href="/"
+                    className="text-gray-300 hover:text-white transition-colors"
+                  >
+                    Dashboard
+                  </a>
+                  <a
+                    href="/treasury"
+                    className="text-gray-300 hover:text-white transition-colors"
+                  >
+                    Treasury
+                  </a>
+                  <a
+                    href="/governance"
+                    className="text-gray-300 hover:text-white transition-colors"
+                  >
+                    Governance
+                  </a>
+                </div>
+                <WalletConnect />
               </div>
-              <div className="hidden md:flex items-center space-x-8">
-                <a
-                  href="/"
-                  className="text-gray-300 hover:text-white transition-colors"
-                >
-                  Dashboard
-                </a>
-                <a
-                  href="/treasury"
-                  className="text-gray-300 hover:text-white transition-colors"
-                >
-                  Treasury
-                </a>
-                <a
-                  href="/governance"
-                  className="text-gray-300 hover:text-white transition-colors"
-                >
-                  Governance
-                </a>
-              </div>
-              {/* TODO: [FE-3] Add WalletConnect button here */}
-              <div className="btn-secondary text-sm">Connect Wallet</div>
             </div>
-          </div>
-        </nav>
-        <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-          {children}
-        </main>
+          </nav>
+          <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+            {children}
+          </main>
+        </FreighterProvider>
       </body>
     </html>
   );
 }
+

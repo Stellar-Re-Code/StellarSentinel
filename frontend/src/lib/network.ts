@@ -55,16 +55,10 @@ export const NETWORK_PASSPHRASE = ACTIVE_NETWORK.networkPassphrase;
 // Helpers
 // ============================================================================
 
-/**
- * Get a Soroban RPC server instance.
- *
- * TODO: Implement with @stellar/stellar-sdk
- * import { SorobanRpc } from "@stellar/stellar-sdk";
- * return new SorobanRpc.Server(SOROBAN_RPC_URL);
- */
-export function getServer() {
-  // TODO: Return SorobanRpc.Server instance
-  throw new Error("Server not initialized — see issue FE-4");
+import { SorobanRpc } from "@stellar/stellar-sdk";
+
+export function getServer(): SorobanRpc.Server {
+  return new SorobanRpc.Server(SOROBAN_RPC_URL);
 }
 
 /**
