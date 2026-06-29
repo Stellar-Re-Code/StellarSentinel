@@ -115,14 +115,19 @@ This document tracks all backend API and infrastructure tasks for the StellarSen
 **Labels:** `backend`, `indexer`, `integration`
 **Description:** Listen for Soroban contract events and index them.
 - **Tasks:**
-  - [ ] Connect to Soroban RPC using `getEvents` API.
-  - [ ] Filter events by contract IDs (treasury, governance, vault, access-control).
-  - [ ] Parse event data (topic, value decoding).
-  - [ ] Store indexed events in PostgreSQL.
-  - [ ] Handle reconnection and missed events (cursor management).
-  - [ ] Process events: `(treasury, deposit)`, `(treasury, propose)`, `(treasury, approve)`, `(treasury, execute)`.
-  - [ ] Process events: `(gov, propose)`, `(gov, vote)`, `(gov, finalize)`, `(gov, exec)`.
-  - [ ] Process events: `(vault, lock)`, `(vault, claim)`, `(vault, vest)`, `(vault, v_claim)`.
+  - [x] Connect to Soroban RPC using `getEvents` API. (@Wilfred007 - 2026-06-29)
+  - [x] Filter events by contract IDs (treasury, governance, vault, access-control). (@Wilfred007 - 2026-06-29)
+  - [x] Parse event data (topic, value decoding). (@Wilfred007 - 2026-06-29)
+  - [x] Store indexed events in SQLite (schema-compatible with PostgreSQL). (@Wilfred007 - 2026-06-29)
+  - [x] Handle reconnection and missed events (cursor management). (@Wilfred007 - 2026-06-29)
+  - [x] Process events: `(treasury, deposit)`, `(treasury, propose)`, `(treasury, approve)`, `(treasury, execute)`. (@Wilfred007 - 2026-06-29)
+  - [x] Process events: `(treasury, revoke)`, `(treasury, cancel)`, `(treasury, add_sig)`, `(treasury, rem_sig)`, `(treasury, thresh)`, `(treasury, admin)`. (@Wilfred007 - 2026-06-29)
+  - [x] Process events: `(gov, propose)`, `(gov, vote)`, `(gov, finalize)`, `(gov, exec)`. (@Wilfred007 - 2026-06-29)
+  - [x] Process events: `(vault, lock)`, `(vault, claim)`, `(vault, vest)`, `(vault, v_claim)`, `(vault, emrg_ap)`, `(vault, emrg_ex)`. (@Wilfred007 - 2026-06-29)
+  - [x] Idempotent replay and checkpoint recovery. (@Wilfred007 - 2026-06-29)
+  - [x] Malformed/unknown-version event quarantine with actionable logs. (@Wilfred007 - 2026-06-29)
+  - [x] Reconciliation checks against on-chain contract balance. (@Wilfred007 - 2026-06-29)
+  - [x] Query/API utilities for frontend proposal history and treasury audit views. (@Wilfred007 - 2026-06-29)
 
 ### Issue #BE-10: Event-Driven Cache Invalidation
 **Priority:** Medium
