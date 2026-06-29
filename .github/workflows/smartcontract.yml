@@ -1,0 +1,48 @@
+name: Smart Contracts
+
+on:
+  push:
+    paths:
+      - "smartcontract/**"
+      - ".github/workflows/smartcontract.yml"
+  pull_request:
+    paths:
+      - "smartcontract/**"
+      - ".github/workflows/smartcontract.yml"
+
+defaults:
+  run:
+    working-directory: smartcontract
+
+jobs:
+  test:
+    name: Build & test (incl. invariant suite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel (1.88.0) and wasm target.
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            smartcontract/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('smartcontract/Cargo.lock') }}
+
+      - name: Format check
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: Build (native)
+        run: cargo build --all
+
+      - name: Test (all crates + cross-contract invariant suite)
+        run: cargo test --all
+
+      - name: Build WASM artifacts
+        run: cargo build --release --target wasm32-unknown-unknown -p stellar-sentinel-treasury -p stellar-sentinel-governance -p stellar-sentinel-token-vault -p stellar-sentinel-access-control

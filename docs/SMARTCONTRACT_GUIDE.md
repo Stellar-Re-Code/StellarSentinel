@@ -134,16 +134,46 @@ StellarSentinel consists of **four Soroban smart contracts** working together:
 
 | Function | Description |
 |----------|-------------|
-| `initialize(owner)` | Set up access control |
-| `assign_role(assignor, target, role)` | Assign a role |
+| `initialize(owner)` | Set up access control; owner gets the Owner role |
+| `assign_role(assignor, target, role)` | Assign or change a subordinate role |
 | `revoke_role(revoker, target)` | Revoke a role |
-| `has_permission(address, required_role)` | Check permission |
-| `is_owner(address)` | Check if owner |
-| `is_admin_or_above(address)` | Check admin+ |
-| `is_member_or_above(address)` | Check member+ |
-| `get_role(address)` | Query role assignment |
-| `get_all_members()` | Query all members |
+| `propose_ownership(current_owner, new_owner)` | Stage a two-step ownership transfer |
+| `accept_ownership(new_owner)` | New owner accepts; old owner demoted to Admin |
+| `cancel_ownership_transfer(current_owner)` | Cancel a pending transfer |
+| `has_permission(address, required_role)` | Check `role >= required_role` |
+| `is_owner` / `is_admin_or_above` / `is_member_or_above` | Threshold checks |
+| `can_assign(actor, role)` | Whether `actor` may assign `role` (matrix-as-code) |
+| `has_role(address)` | Membership check |
+| `get_role(address)` | Query a role assignment |
+| `get_role_count(role)` | Count of addresses holding a role |
+| `get_all_members()` / `get_all_assignments()` | List members / typed assignments |
+| `get_pending_owner()` | Pending owner of an in-flight transfer, if any |
 | `get_summary()` | Query access summary |
+
+**Permission matrix** (assignment and revocation):
+
+| Actor \ Target role | Viewer | Member | Admin | Owner |
+|---------------------|--------|--------|-------|-------|
+| Owner | assign / revoke | assign / revoke | assign / revoke | transfer flow only |
+| Admin | assign / revoke | assign / revoke | denied | denied |
+| Member / Viewer | denied | denied | denied | denied |
+
+Rules enforced by the contract:
+- The Owner role is never set through `assign_role`; it moves only via
+  `propose_ownership` → `accept_ownership` (single-Owner invariant preserved).
+- An Admin cannot modify or revoke another Admin; only the Owner can.
+- No actor can change its own role (no self-escalation or self-demotion).
+- Re-assigning the exact role already held fails with `RoleAlreadyAssigned`.
+- The Owner cannot be revoked (`CannotRemoveOwner`).
+
+**Consuming access-control from other contracts:** treasury, governance, and
+token-vault gate privileged operations by cross-contract-calling the read-only
+checks. For example, before an admin-only action a caller is verified with
+`AccessControlClient::new(&env, &acl_id).is_admin_or_above(&caller)`, and
+participation gates use `is_member_or_above` / `has_permission(addr, Role::Member)`.
+These calls are side-effect-free and safe to invoke during validation. The
+`(acl, *)` events (schema v1) let indexers reconstruct the full authorization
+history off-chain.
 
 ---
 
@@ -193,7 +223,18 @@ cargo test --all
 
 # Run with output
 cargo test --all -- --nocapture
+
+# Cross-contract security invariant suite (issue #44)
+cargo test -p stellar-sentinel-integration-tests
 ```
+
+### Cross-contract invariant suite
+
+`contracts/integration-tests` drives all four contracts together and verifies
+custody, authorization, replay resistance, and lifecycle terminality across
+deterministic operation sequences. See
+`contracts/integration-tests/INVARIANTS.md` for the rule-to-test matrix and
+`RESOURCE-REPORT.md` for storage-growth measurements.
 
 ---
 
@@ -253,10 +294,16 @@ Repeat for each contract (governance, token-vault, access-control).
 | `(vault, emrg_ap)` | `(lock_id, signer, approval_count)` | Emergency approval |
 | `(vault, emrg_ex)` | `(lock_id, caller, amount)` | Emergency unlock executed |
 
-### Access Control Events
+### Access Control Events (schema v1)
+
+Every payload ends with a `version` field (`EVENT_SCHEMA_VERSION`). Role values are
+`u32` (`Viewer=1, Member=2, Admin=3, Owner=4`); `old_role = 0` means "no prior role".
+
 | Topic | Data | Description |
 |-------|------|-------------|
-| `(acl, init)` | `(owner)` | Contract initialized |
-| `(acl, assign)` | `(target, role, assignor)` | Role assigned |
-| `(acl, revoke)` | `(target, revoker)` | Role revoked |
-| `(acl, owner)` | `(old_owner, new_owner)` | Ownership transferred |
+| `(acl, init)` | `(owner, version)` | Contract initialized |
+| `(acl, assign)` | `(assignor, target, old_role, new_role, version)` | Role assigned/changed |
+| `(acl, revoke)` | `(revoker, target, old_role, version)` | Role revoked |
+| `(acl, own_prop)` | `(current_owner, pending_owner, version)` | Ownership transfer proposed |
+| `(acl, owner)` | `(old_owner, new_owner, version)` | Ownership transfer accepted |
+| `(acl, own_cxl)` | `(current_owner, canceled_pending, version)` | Ownership transfer canceled |

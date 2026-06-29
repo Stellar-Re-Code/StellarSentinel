@@ -6,6 +6,7 @@ members = [
     "contracts/governance",
     "contracts/token-vault",
     "contracts/access-control",
+    "contracts/integration-tests",
 ]
 
 [workspace.dependencies]
