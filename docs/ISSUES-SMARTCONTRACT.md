@@ -298,7 +298,7 @@ This document tracks all smart contract development tasks for the StellarSentine
   - [ ] Test `assign_role` — privilege escalation prevention.
   - [ ] Test `revoke_role` — cannot remove owner.
   - [ ] Test `has_permission`, `is_owner`, `is_admin_or_above`, `is_member_or_above`.
-  - [ ] Test `transfer_ownership` — old owner demoted to admin.
+  - [ ] Test two-step ownership transfer (`propose_ownership` → `accept_ownership`) — old owner demoted to admin, single-owner invariant preserved.
 
 ### Issue #SC-25: Integration Test Suite
 **Priority:** High

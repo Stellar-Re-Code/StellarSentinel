@@ -1,10 +1,50 @@
 #![no_std]
 
+//! # Access Control
+//!
+//! Role-based access control for the StellarSentinel system. Other contracts
+//! (treasury, governance, token-vault) consume the read-only permission checks
+//! (`has_permission`, `is_owner`, `is_admin_or_above`, `is_member_or_above`) to
+//! gate privileged operations.
+//!
+//! ## Role hierarchy (ascending privilege)
+//!
+//! | Role     | Value | Capability summary                                   |
+//! |----------|-------|------------------------------------------------------|
+//! | Viewer   | 1     | Read-only participation.                             |
+//! | Member   | 2     | Participate (vote, deposit), no management.          |
+//! | Admin    | 3     | Manage Member/Viewer roles, moderate operations.     |
+//! | Owner    | 4     | Full control. Exactly one Owner exists at all times. |
+//!
+//! ## Permission matrix
+//!
+//! Assignment (`assign_role`) and revocation (`revoke_role`):
+//!
+//! | Actor \ Target role | Viewer | Member | Admin        | Owner          |
+//! |---------------------|--------|--------|--------------|----------------|
+//! | Owner               | assign | assign | assign       | (transfer only)|
+//! | Admin               | assign | assign | denied       | denied         |
+//! | Member / Viewer     | denied | denied | denied       | denied         |
+//!
+//! - Ownership is **never** changed through `assign_role`. It moves only through the
+//!   two-step `propose_ownership` -> `accept_ownership` flow (with
+//!   `cancel_ownership_transfer`), which keeps the single-Owner invariant intact and
+//!   prevents accidental owner lockout.
+//! - An Admin cannot modify another Admin's role; only the Owner can.
+//! - No actor can change its own role (`assign_role`/`revoke_role` reject self-targeting),
+//!   preventing self-escalation and self-demotion.
+//! - Re-assigning the exact role an address already holds is rejected
+//!   (`RoleAlreadyAssigned`); changing to a different role is allowed and recorded.
+
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, symbol_short,
     Address, Env, Vec,
     log,
 };
+
+/// Schema version stamped onto every emitted event so off-chain indexers can
+/// decode payloads deterministically across contract upgrades.
+pub const EVENT_SCHEMA_VERSION: u32 = 1;
 
 // ============================================================================
 // Error Codes
@@ -23,14 +63,22 @@ pub enum Error {
     Unauthorized = 3,
     /// Role not found for the given address.
     RoleNotFound = 4,
-    /// Address already has a role assigned.
+    /// Address already holds the exact role being assigned.
     RoleAlreadyAssigned = 5,
-    /// Invalid role level specified.
+    /// Invalid role for the requested operation (e.g. assigning Owner directly).
     InvalidRole = 6,
     /// Cannot remove the contract owner.
     CannotRemoveOwner = 7,
     /// Action requires higher privilege level.
     InsufficientPrivilege = 8,
+    /// An actor attempted to modify its own role.
+    SelfModification = 9,
+    /// No pending ownership transfer exists.
+    NoPendingOwner = 10,
+    /// Caller is not the pending owner of the active transfer.
+    NotPendingOwner = 11,
+    /// The proposed new owner already holds a role conflicting with the transfer.
+    OwnerExists = 12,
 }
 
 // ============================================================================
@@ -61,6 +109,8 @@ pub enum DataKey {
     Initialized,
     /// The contract owner address.
     Owner,
+    /// The pending owner of an in-flight ownership transfer.
+    PendingOwner,
     /// Role assignment for an address.
     Role(Address),
     /// List of all addresses with roles.
@@ -156,7 +206,7 @@ impl AccessControlContract {
 
         env.events().publish(
             (symbol_short!("acl"), symbol_short!("init")),
-            owner.clone(),
+            (owner.clone(), EVENT_SCHEMA_VERSION),
         );
 
         log!(&env, "Access control initialized with owner {:?}", owner);
@@ -168,9 +218,14 @@ impl AccessControlContract {
     // ========================================================================
 
     /// Assign a role to an address.
-    /// Only admins and owners can assign roles.
-    /// Admins can only assign Member and Viewer roles.
-    /// Only owners can assign Admin roles.
+    ///
+    /// Authorization rules (see the permission matrix in the module docs):
+    /// - Only the Owner may assign the Admin role.
+    /// - Owner or Admin may assign Member and Viewer roles.
+    /// - The Owner role is never assigned here; use the ownership transfer flow.
+    /// - An Admin cannot modify another Admin's role.
+    /// - An actor cannot change its own role.
+    /// - Re-assigning the exact role already held fails with `RoleAlreadyAssigned`.
     ///
     /// # Arguments
     /// * `assignor` - The address assigning the role (must be Admin or Owner).
@@ -186,33 +241,43 @@ impl AccessControlContract {
 
         assignor.require_auth();
 
-        // Get assignor's role
+        // An actor may never change its own role (blocks self-escalation/demotion).
+        if assignor == target {
+            return Err(Error::SelfModification);
+        }
+
+        // Ownership only moves through the dedicated two-step transfer flow.
+        if role == Role::Owner {
+            return Err(Error::InvalidRole);
+        }
+
         let assignor_role = Self::internal_get_role(&env, &assignor)?;
 
-        // Only Owner can assign Owner or Admin roles
+        // Hierarchy: only Owner assigns Admin; Owner/Admin assign Member/Viewer.
         match role {
-            Role::Owner | Role::Admin => {
+            Role::Admin => {
                 if assignor_role != Role::Owner {
                     return Err(Error::InsufficientPrivilege);
                 }
             }
             Role::Member | Role::Viewer => {
-                // Admin or Owner can assign these
                 if assignor_role != Role::Owner && assignor_role != Role::Admin {
                     return Err(Error::InsufficientPrivilege);
                 }
             }
+            // Already rejected above; kept exhaustive without panicking.
+            Role::Owner => return Err(Error::InvalidRole),
         }
 
-        // Get current role count for the new role
-        let role_val = role.clone() as u32;
+        let role_val = role as u32;
         let mut count: u32 = env
             .storage()
             .instance()
             .get(&DataKey::RoleCount(role_val))
             .unwrap_or(0);
 
-        // If target already has a role, decrement old role count
+        // Determine the previous role (0 = none) and maintain counts / membership.
+        let mut old_role_val: u32 = 0;
         if env
             .storage()
             .persistent()
@@ -223,7 +288,18 @@ impl AccessControlContract {
                 .persistent()
                 .get(&DataKey::Role(target.clone()))
                 .unwrap();
-            let old_role_val = old_assignment.role as u32;
+
+            // Subordinate rule: only the Owner can modify an existing Admin.
+            if old_assignment.role == Role::Admin && assignor_role != Role::Owner {
+                return Err(Error::InsufficientPrivilege);
+            }
+
+            // Reject a no-op duplicate assignment of the identical role.
+            if old_assignment.role == role {
+                return Err(Error::RoleAlreadyAssigned);
+            }
+
+            old_role_val = old_assignment.role as u32;
             let mut old_count: u32 = env
                 .storage()
                 .instance()
@@ -236,7 +312,7 @@ impl AccessControlContract {
                 .instance()
                 .set(&DataKey::RoleCount(old_role_val), &old_count);
         } else {
-            // New member — add to the list
+            // New member — add to the list.
             let mut members: Vec<Address> = env
                 .storage()
                 .instance()
@@ -248,10 +324,9 @@ impl AccessControlContract {
                 .set(&DataKey::AllMembers, &members);
         }
 
-        // Create assignment
         let assignment = RoleAssignment {
             address: target.clone(),
-            role: role.clone(),
+            role,
             assigned_at: env.ledger().timestamp(),
             assigned_by: assignor.clone(),
         };
@@ -260,7 +335,6 @@ impl AccessControlContract {
             .persistent()
             .set(&DataKey::Role(target.clone()), &assignment);
 
-        // Update role count
         count += 1;
         env.storage()
             .instance()
@@ -268,7 +342,7 @@ impl AccessControlContract {
 
         env.events().publish(
             (symbol_short!("acl"), symbol_short!("assign")),
-            (target.clone(), role, assignor.clone()),
+            (assignor, target, old_role_val, role_val, EVENT_SCHEMA_VERSION),
         );
 
         Ok(())
@@ -276,6 +350,7 @@ impl AccessControlContract {
 
     /// Revoke a role from an address.
     /// Owners cannot be removed. Only owners can revoke admin roles.
+    /// An actor cannot revoke its own role.
     pub fn revoke_role(
         env: Env,
         revoker: Address,
@@ -285,50 +360,53 @@ impl AccessControlContract {
 
         revoker.require_auth();
 
+        if revoker == target {
+            return Err(Error::SelfModification);
+        }
+
         let revoker_role = Self::internal_get_role(&env, &revoker)?;
 
-        // Must be admin or owner to revoke
+        // Must be admin or owner to revoke.
         if revoker_role != Role::Owner && revoker_role != Role::Admin {
             return Err(Error::InsufficientPrivilege);
         }
 
-        // Get target's current assignment
         let target_assignment: RoleAssignment = env
             .storage()
             .persistent()
             .get(&DataKey::Role(target.clone()))
             .ok_or(Error::RoleNotFound)?;
 
-        // Cannot remove owners
+        // Cannot remove owners.
         if target_assignment.role == Role::Owner {
             return Err(Error::CannotRemoveOwner);
         }
 
-        // Only owners can revoke admin roles
+        // Only owners can revoke admin roles.
         if target_assignment.role == Role::Admin && revoker_role != Role::Owner {
             return Err(Error::InsufficientPrivilege);
         }
 
-        // Decrement role count
-        let role_val = target_assignment.role as u32;
+        // Decrement role count.
+        let old_role_val = target_assignment.role as u32;
         let mut count: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::RoleCount(role_val))
+            .get(&DataKey::RoleCount(old_role_val))
             .unwrap_or(1);
         if count > 0 {
             count -= 1;
         }
         env.storage()
             .instance()
-            .set(&DataKey::RoleCount(role_val), &count);
+            .set(&DataKey::RoleCount(old_role_val), &count);
 
-        // Remove role assignment
+        // Remove role assignment.
         env.storage()
             .persistent()
             .remove(&DataKey::Role(target.clone()));
 
-        // Remove from members list
+        // Remove from members list.
         let members: Vec<Address> = env
             .storage()
             .instance()
@@ -347,7 +425,7 @@ impl AccessControlContract {
 
         env.events().publish(
             (symbol_short!("acl"), symbol_short!("revoke")),
-            (target.clone(), revoker.clone()),
+            (revoker, target, old_role_val, EVENT_SCHEMA_VERSION),
         );
 
         Ok(())
@@ -394,16 +472,47 @@ impl AccessControlContract {
         }
     }
 
+    /// Permission-matrix-as-code: whether `actor` may assign `role` via `assign_role`.
+    /// Mirrors the authorization rules enforced in `assign_role`.
+    pub fn can_assign(env: Env, actor: Address, role: Role) -> bool {
+        // Owner is never assignable through `assign_role`.
+        if role == Role::Owner {
+            return false;
+        }
+        let actor_role = match Self::internal_get_role(&env, &actor) {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        match role {
+            Role::Admin => actor_role == Role::Owner,
+            Role::Member | Role::Viewer => actor_role >= Role::Admin,
+            Role::Owner => false,
+        }
+    }
+
     // ========================================================================
     // Query Functions
     // ========================================================================
 
-    /// Get the role of an address.
+    /// Get the role assignment record of an address.
     pub fn get_role(env: Env, address: Address) -> Result<RoleAssignment, Error> {
         env.storage()
             .persistent()
             .get(&DataKey::Role(address))
             .ok_or(Error::RoleNotFound)
+    }
+
+    /// Whether an address currently holds any role (membership check).
+    pub fn has_role(env: Env, address: Address) -> bool {
+        env.storage().persistent().has(&DataKey::Role(address))
+    }
+
+    /// Get the number of addresses holding a specific role.
+    pub fn get_role_count(env: Env, role: Role) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::RoleCount(role as u32))
+            .unwrap_or(0)
     }
 
     /// Get all members with roles.
@@ -412,6 +521,32 @@ impl AccessControlContract {
             .instance()
             .get(&DataKey::AllMembers)
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Get every role assignment as a typed list.
+    pub fn get_all_assignments(env: Env) -> Vec<RoleAssignment> {
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllMembers)
+            .unwrap_or(Vec::new(&env));
+        let mut out = Vec::new(&env);
+        for i in 0..members.len() {
+            let m = members.get(i).unwrap();
+            if let Some(a) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, RoleAssignment>(&DataKey::Role(m))
+            {
+                out.push_back(a);
+            }
+        }
+        out
+    }
+
+    /// Get the pending owner of an in-flight ownership transfer, if any.
+    pub fn get_pending_owner(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingOwner)
     }
 
     /// Get the access control summary.
@@ -460,12 +595,15 @@ impl AccessControlContract {
     }
 
     // ========================================================================
-    // Admin Functions
+    // Ownership Lifecycle (two-step transfer)
     // ========================================================================
 
-    /// Transfer ownership to a new address.
-    /// Only the current owner can transfer ownership.
-    pub fn transfer_ownership(
+    /// Propose transferring ownership to `new_owner`.
+    ///
+    /// Stages a pending transfer; the new owner must call `accept_ownership` to
+    /// complete it. Only the current owner may propose. This two-step flow prevents
+    /// accidental owner lockout (e.g. a typo'd address can never silently take over).
+    pub fn propose_ownership(
         env: Env,
         current_owner: Address,
         new_owner: Address,
@@ -479,76 +617,188 @@ impl AccessControlContract {
             .instance()
             .get(&DataKey::Owner)
             .ok_or(Error::NotInitialized)?;
-
         if current_owner != stored_owner {
             return Err(Error::Unauthorized);
         }
 
-        // Update owner
+        if new_owner == current_owner {
+            return Err(Error::SelfModification);
+        }
+
+        // The proposed owner must not already be an Owner (single-owner invariant).
+        if Self::internal_get_role(&env, &new_owner) == Ok(Role::Owner) {
+            return Err(Error::OwnerExists);
+        }
+
         env.storage()
             .instance()
-            .set(&DataKey::Owner, &new_owner);
+            .set(&DataKey::PendingOwner, &new_owner);
 
-        // Update role assignments
-        let new_owner_assignment = RoleAssignment {
-            address: new_owner.clone(),
-            role: Role::Owner,
-            assigned_at: env.ledger().timestamp(),
-            assigned_by: current_owner.clone(),
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::Role(new_owner.clone()), &new_owner_assignment);
+        env.events().publish(
+            (symbol_short!("acl"), symbol_short!("own_prop")),
+            (current_owner, new_owner, EVENT_SCHEMA_VERSION),
+        );
 
-        // Demote old owner to admin
-        let old_owner_assignment = RoleAssignment {
-            address: current_owner.clone(),
-            role: Role::Admin,
-            assigned_at: env.ledger().timestamp(),
-            assigned_by: current_owner.clone(),
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::Role(current_owner.clone()), &old_owner_assignment);
+        Ok(())
+    }
 
-        // Ensure new owner is in members list
-        let mut members: Vec<Address> = env
+    /// Accept a pending ownership transfer. Must be called by the pending owner.
+    ///
+    /// The previous owner is demoted to Admin and the caller becomes the sole Owner.
+    /// Role counts are kept consistent and exactly one Owner remains.
+    pub fn accept_ownership(env: Env, new_owner: Address) -> Result<(), Error> {
+        Self::require_initialized(&env)?;
+
+        new_owner.require_auth();
+
+        let pending: Address = env
             .storage()
             .instance()
-            .get(&DataKey::AllMembers)
-            .unwrap_or(Vec::new(&env));
-        let mut found = false;
-        for i in 0..members.len() {
-            if members.get(i).unwrap() == new_owner {
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            members.push_back(new_owner.clone());
-            env.storage()
-                .instance()
-                .set(&DataKey::AllMembers, &members);
+            .get(&DataKey::PendingOwner)
+            .ok_or(Error::NoPendingOwner)?;
+        if pending != new_owner {
+            return Err(Error::NotPendingOwner);
         }
 
-        // Update role counts
+        let old_owner: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Owner)
+            .ok_or(Error::NotInitialized)?;
+
+        let now = env.ledger().timestamp();
+
+        // Old owner: Owner -> Admin.
+        let mut owner_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RoleCount(Role::Owner as u32))
+            .unwrap_or(1);
+        if owner_count > 0 {
+            owner_count -= 1;
+        }
         let mut admin_count: u32 = env
             .storage()
             .instance()
             .get(&DataKey::RoleCount(Role::Admin as u32))
             .unwrap_or(0);
         admin_count += 1;
+
+        let old_owner_assignment = RoleAssignment {
+            address: old_owner.clone(),
+            role: Role::Admin,
+            assigned_at: now,
+            assigned_by: old_owner.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Role(old_owner.clone()), &old_owner_assignment);
+
+        // New owner: decrement its prior role count (if any) or add to members.
+        if let Some(prev) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, RoleAssignment>(&DataKey::Role(new_owner.clone()))
+        {
+            let prev_val = prev.role as u32;
+            if prev_val == Role::Admin as u32 {
+                if admin_count > 0 {
+                    admin_count -= 1;
+                }
+            } else {
+                let mut c: u32 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::RoleCount(prev_val))
+                    .unwrap_or(1);
+                if c > 0 {
+                    c -= 1;
+                }
+                env.storage()
+                    .instance()
+                    .set(&DataKey::RoleCount(prev_val), &c);
+            }
+        } else {
+            let mut members: Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::AllMembers)
+                .unwrap_or(Vec::new(&env));
+            members.push_back(new_owner.clone());
+            env.storage()
+                .instance()
+                .set(&DataKey::AllMembers, &members);
+        }
+
+        owner_count += 1;
+
+        let new_owner_assignment = RoleAssignment {
+            address: new_owner.clone(),
+            role: Role::Owner,
+            assigned_at: now,
+            assigned_by: old_owner.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Role(new_owner.clone()), &new_owner_assignment);
+
+        // Persist counts and the new owner pointer; clear the pending transfer.
+        env.storage()
+            .instance()
+            .set(&DataKey::RoleCount(Role::Owner as u32), &owner_count);
         env.storage()
             .instance()
             .set(&DataKey::RoleCount(Role::Admin as u32), &admin_count);
+        env.storage()
+            .instance()
+            .set(&DataKey::Owner, &new_owner);
+        env.storage().instance().remove(&DataKey::PendingOwner);
 
         env.events().publish(
             (symbol_short!("acl"), symbol_short!("owner")),
-            (current_owner, new_owner.clone()),
+            (old_owner, new_owner, EVENT_SCHEMA_VERSION),
         );
 
         Ok(())
     }
+
+    /// Cancel an in-flight ownership transfer. Only the current owner may cancel.
+    pub fn cancel_ownership_transfer(
+        env: Env,
+        current_owner: Address,
+    ) -> Result<(), Error> {
+        Self::require_initialized(&env)?;
+
+        current_owner.require_auth();
+
+        let stored_owner: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Owner)
+            .ok_or(Error::NotInitialized)?;
+        if current_owner != stored_owner {
+            return Err(Error::Unauthorized);
+        }
+
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingOwner)
+            .ok_or(Error::NoPendingOwner)?;
+
+        env.storage().instance().remove(&DataKey::PendingOwner);
+
+        env.events().publish(
+            (symbol_short!("acl"), symbol_short!("own_cxl")),
+            (current_owner, pending, EVENT_SCHEMA_VERSION),
+        );
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Admin Functions
+    // ========================================================================
 
     /// Upgrade contract WASM. Owner only.
     pub fn upgrade(
@@ -599,86 +849,4 @@ impl AccessControlContract {
 // ============================================================================
 
 #[cfg(test)]
-mod test {
-    use super::*;
-    use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::Env;
-
-    fn setup_contract() -> (Env, Address, AccessControlContractClient<'static>) {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, AccessControlContract);
-        let client = AccessControlContractClient::new(&env, &contract_id);
-        let owner = Address::generate(&env);
-        (env, owner, client)
-    }
-
-    #[test]
-    fn test_initialize() {
-        let (env, owner, client) = setup_contract();
-
-        client.initialize(&owner);
-
-        let summary = client.get_summary();
-        assert_eq!(summary.owner, owner);
-        assert_eq!(summary.total_members, 1);
-        assert_eq!(summary.owner_count, 1);
-    }
-
-    #[test]
-    fn test_assign_roles() {
-        let (env, owner, client) = setup_contract();
-
-        client.initialize(&owner);
-
-        let admin = Address::generate(&env);
-        let member = Address::generate(&env);
-        let viewer = Address::generate(&env);
-
-        // Owner assigns Admin
-        client.assign_role(&owner, &admin, &Role::Admin);
-        // Owner assigns Member
-        client.assign_role(&owner, &member, &Role::Member);
-        // Admin assigns Viewer
-        client.assign_role(&admin, &viewer, &Role::Viewer);
-
-        let summary = client.get_summary();
-        assert_eq!(summary.total_members, 4);
-        assert_eq!(summary.admin_count, 1);
-        assert_eq!(summary.member_count, 1);
-        assert_eq!(summary.viewer_count, 1);
-    }
-
-    #[test]
-    fn test_permission_checks() {
-        let (env, owner, client) = setup_contract();
-
-        client.initialize(&owner);
-
-        let member = Address::generate(&env);
-        client.assign_role(&owner, &member, &Role::Member);
-
-        assert_eq!(client.is_owner(&owner), true);
-        assert_eq!(client.is_owner(&member), false);
-        assert_eq!(client.is_member_or_above(&member), true);
-        assert_eq!(client.is_admin_or_above(&member), false);
-        assert_eq!(client.has_permission(&member, &Role::Viewer), true);
-        assert_eq!(client.has_permission(&member, &Role::Admin), false);
-    }
-
-    #[test]
-    fn test_revoke_role() {
-        let (env, owner, client) = setup_contract();
-
-        client.initialize(&owner);
-
-        let member = Address::generate(&env);
-        client.assign_role(&owner, &member, &Role::Member);
-
-        assert_eq!(client.is_member_or_above(&member), true);
-
-        client.revoke_role(&owner, &member);
-
-        assert_eq!(client.is_member_or_above(&member), false);
-    }
-}
+mod test;

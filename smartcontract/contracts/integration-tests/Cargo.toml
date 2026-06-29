@@ -1,0 +1,18 @@
+[package]
+name = "stellar-sentinel-integration-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Test-only crate: drives all four contracts together to verify cross-contract
+# security invariants. It produces no WASM artifact, so the contract dependencies
+# (compiled with `testutils`) are dev-dependencies and never enter a release build.
+[lib]
+doctest = false
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+stellar-sentinel-treasury = { path = "../treasury", features = ["testutils"] }
+stellar-sentinel-governance = { path = "../governance", features = ["testutils"] }
+stellar-sentinel-token-vault = { path = "../token-vault", features = ["testutils"] }
+stellar-sentinel-access-control = { path = "../access-control", features = ["testutils"] }
