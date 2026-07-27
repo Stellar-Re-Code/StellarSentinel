@@ -13,8 +13,12 @@ fn setup() -> (
 ) {
     let env = new_env();
     let admin = soroban_sdk::testutils::Address::generate(&env);
+    let (acl_id, acl) = deploy_acl(&env, &admin);
     let signers = addrs(&env, 3);
-    let c = deploy_vault(&env, &admin, &svec(&env, &signers), 2);
+    for s in &signers {
+        acl.assign_role(&admin, s, &Role::Member);
+    }
+    let c = deploy_vault(&env, &admin, &svec(&env, &signers), 2, &acl_id);
     (env, admin, signers, c)
 }
 

@@ -17,7 +17,7 @@ fn role_of(rng_val: u64) -> Role {
 fn unauthorized_escalation_rejected() {
     let env = new_env();
     let owner = soroban_sdk::testutils::Address::generate(&env);
-    let c = deploy_acl(&env, &owner);
+    let (_, c) = deploy_acl(&env, &owner);
 
     let member = soroban_sdk::testutils::Address::generate(&env);
     let target = soroban_sdk::testutils::Address::generate(&env);
@@ -36,7 +36,7 @@ fn unauthorized_escalation_rejected() {
 fn single_owner_through_transfers() {
     let env = new_env();
     let owner = soroban_sdk::testutils::Address::generate(&env);
-    let c = deploy_acl(&env, &owner);
+    let (_, c) = deploy_acl(&env, &owner);
     let chain = addrs(&env, 4);
 
     let mut current = owner;
@@ -57,7 +57,7 @@ fn seeded_operation_sequences() {
     for seed in [5u64, 55, 555, 9090] {
         let env = new_env();
         let owner = soroban_sdk::testutils::Address::generate(&env);
-        let c = deploy_acl(&env, &owner);
+        let (_, c) = deploy_acl(&env, &owner);
         let pool = addrs(&env, 5);
         let mut current = owner.clone();
         let mut rng = Rng::new(seed);

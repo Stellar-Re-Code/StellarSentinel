@@ -16,24 +16,20 @@ fn role_decisions_gate_privileged_treasury_actions() {
     let admin = soroban_sdk::testutils::Address::generate(&env);
     let member = soroban_sdk::testutils::Address::generate(&env);
 
-    let acl = deploy_acl(&env, &owner);
+    let (acl_id, acl) = deploy_acl(&env, &owner);
     acl.assign_role(&owner, &admin, &Role::Admin);
     acl.assign_role(&owner, &member, &Role::Member);
 
-    // Access-control's view of privilege.
     assert_eq!(acl.is_admin_or_above(&owner), true);
     assert_eq!(acl.is_admin_or_above(&admin), true);
     assert_eq!(acl.is_admin_or_above(&member), false);
     assert_eq!(acl.is_owner(&member), false);
 
-    // A treasury administered by `owner`, with its own signer set.
     let signers = addrs(&env, 2);
     let asset = soroban_sdk::testutils::Address::generate(&env);
-    let treasury = deploy_treasury(&env, &owner, &asset, 1, &svec(&env, &signers));
+    let treasury = deploy_treasury(&env, &owner, &asset, 1, &svec(&env, &signers), &acl_id);
     treasury.deposit(&signers[0], &10_000);
 
-    // The plain member (not admin, not signer) is blocked from privileged ops,
-    // mirroring its lack of role privilege in access-control.
     assert_eq!(
         treasury.try_set_threshold(&member, &1),
         Err(Ok(treasury::Error::Unauthorized))
@@ -53,11 +49,11 @@ fn role_decisions_gate_privileged_treasury_actions() {
 fn governance_membership_lifecycle_updates_authorization() {
     let env = new_env();
     let admin = soroban_sdk::testutils::Address::generate(&env);
+    let (acl_id, _acl) = deploy_acl(&env, &admin);
     let members = addrs(&env, 3);
-    let gov = deploy_governance(&env, &admin, &svec(&env, &members), 34, 50); // threshold 1
+    let gov = deploy_governance(&env, &admin, &svec(&env, &members), 34, 50, &acl_id);
 
     let newbie = soroban_sdk::testutils::Address::generate(&env);
-    // Non-members cannot propose.
     assert_eq!(
         gov.try_create_proposal(
             &newbie,
@@ -70,7 +66,6 @@ fn governance_membership_lifecycle_updates_authorization() {
         Err(Ok(governance::Error::NotAMember))
     );
 
-    // Add the newbie via a passed AddMember proposal.
     let add = gov.create_proposal(
         &members[0],
         &symbol_short!("add"),
@@ -85,7 +80,6 @@ fn governance_membership_lifecycle_updates_authorization() {
     gov.execute_proposal(&admin, &add);
     assert_eq!(gov.get_config().member_count, 4);
 
-    // Newbie now has voting/proposal rights.
     let p = gov.create_proposal(
         &newbie,
         &symbol_short!("p"),
@@ -94,9 +88,8 @@ fn governance_membership_lifecycle_updates_authorization() {
         &0,
         &newbie,
     );
-    gov.vote(&newbie, &p, &true); // no panic => authorized
+    gov.vote(&newbie, &p, &true);
 
-    // Remove members[1] via a passed RemoveMember proposal.
     let rem = gov.create_proposal(
         &members[0],
         &symbol_short!("rem"),
@@ -111,7 +104,6 @@ fn governance_membership_lifecycle_updates_authorization() {
     gov.execute_proposal(&admin, &rem);
     assert_eq!(gov.get_config().member_count, 3);
 
-    // The removed member can no longer act — no stale membership.
     assert_eq!(
         gov.try_create_proposal(
             &members[1],
@@ -131,12 +123,13 @@ fn governance_membership_lifecycle_updates_authorization() {
 fn terminal_operations_cannot_replay_across_contracts() {
     let env = new_env();
 
-    // Treasury: execute once, replay rejected.
     let admin = soroban_sdk::testutils::Address::generate(&env);
+    let (acl_id, _acl) = deploy_acl(&env, &admin);
+
     let signers = addrs(&env, 2);
     let asset = soroban_sdk::testutils::Address::generate(&env);
     let recipient = soroban_sdk::testutils::Address::generate(&env);
-    let treasury = deploy_treasury(&env, &admin, &asset, 2, &svec(&env, &signers));
+    let treasury = deploy_treasury(&env, &admin, &asset, 2, &svec(&env, &signers), &acl_id);
     treasury.deposit(&signers[0], &10_000);
     let exp = env.ledger().timestamp() + 10_000;
     let tx = treasury.propose_withdrawal(&signers[0], &recipient, &4_000, &symbol_short!("r"), &exp);
@@ -147,9 +140,8 @@ fn terminal_operations_cannot_replay_across_contracts() {
         Err(Ok(treasury::Error::AlreadyExecuted))
     );
 
-    // Governance: execute a passed proposal once, replay rejected.
     let gmembers = addrs(&env, 3);
-    let gov = deploy_governance(&env, &admin, &svec(&env, &gmembers), 34, 50);
+    let gov = deploy_governance(&env, &admin, &svec(&env, &gmembers), 34, 50, &acl_id);
     let pid = gov.create_proposal(
         &gmembers[0],
         &symbol_short!("t"),
@@ -167,9 +159,8 @@ fn terminal_operations_cannot_replay_across_contracts() {
         Err(Ok(governance::Error::ProposalRejected))
     );
 
-    // Vault: emergency unlock once, replay rejected.
     let esigners = addrs(&env, 2);
-    let vault = deploy_vault(&env, &admin, &svec(&env, &esigners), 2);
+    let vault = deploy_vault(&env, &admin, &svec(&env, &esigners), 2, &acl_id);
     let owner = soroban_sdk::testutils::Address::generate(&env);
     let lock = vault.lock_tokens(&owner, &5_000, &100_000, &symbol_short!("l"));
     vault.approve_emergency(&esigners[0], &lock);

@@ -10,6 +10,8 @@ use soroban_sdk::{
     log,
 };
 
+use stellar_sentinel_access_control::AccessControlContractClient;
+
 // ============================================================================
 // Error Codes
 // ============================================================================
@@ -85,6 +87,8 @@ pub enum DataKey {
     Initialized,
     /// The current policy version for multi-sig.
     PolicyVersion,
+    /// The access-control contract address for RBAC enforcement.
+    AclAddress,
 }
 
 /// A pending transaction proposal in the multi-sig treasury.
@@ -156,6 +160,7 @@ impl TreasuryContract {
     /// * `asset` - The Stellar Asset Contract address bound to this treasury.
     /// * `threshold` - The number of approvals required for withdrawals.
     /// * `signers` - Initial list of authorized signers.
+    /// * `acl_address` - The access-control contract address for RBAC enforcement.
     ///
     /// # Errors
     /// * `Error::AlreadyInitialized` - If the contract was already initialized.
@@ -167,6 +172,7 @@ impl TreasuryContract {
         asset: Address,
         threshold: u32,
         signers: Vec<Address>,
+        acl_address: Address,
     ) -> Result<(), Error> {
         // Prevent re-initialization
         if env.storage().instance().has(&DataKey::Initialized) {
@@ -188,6 +194,12 @@ impl TreasuryContract {
             return Err(Error::InvalidThreshold);
         }
 
+        // Verify admin has Admin+ role in ACL
+        let acl_client = AccessControlContractClient::new(&env, &acl_address);
+        if !acl_client.is_admin_or_above(&admin) {
+            return Err(Error::Unauthorized);
+        }
+
         admin.require_auth();
 
         // Store all initial state
@@ -199,6 +211,7 @@ impl TreasuryContract {
         env.storage().instance().set(&DataKey::Balance, &0_i128);
         env.storage().instance().set(&DataKey::TxCounter, &0_u64);
         env.storage().instance().set(&DataKey::PolicyVersion, &1_u32);
+        env.storage().instance().set(&DataKey::AclAddress, &acl_address);
 
         // Emit initialization event
         env.events().publish(
@@ -843,6 +856,8 @@ impl TreasuryContract {
 
         current_admin.require_auth();
 
+        Self::require_acl_admin_or_above(&env, &new_admin)?;
+
         env.storage()
             .instance()
             .set(&DataKey::Admin, &new_admin);
@@ -877,6 +892,31 @@ impl TreasuryContract {
         Ok(())
     }
 
+    fn get_acl(env: &Env) -> Result<AccessControlContractClient, Error> {
+        let acl_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AclAddress)
+            .ok_or(Error::NotInitialized)?;
+        Ok(AccessControlContractClient::new(env, &acl_address))
+    }
+
+    fn require_acl_admin_or_above(env: &Env, caller: &Address) -> Result<(), Error> {
+        let acl = Self::get_acl(env)?;
+        if !acl.is_admin_or_above(caller) {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
+
+    fn require_acl_member_or_above(env: &Env, caller: &Address) -> Result<(), Error> {
+        let acl = Self::get_acl(env)?;
+        if !acl.is_member_or_above(caller) {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
+
     fn require_admin(env: &Env, caller: &Address) -> Result<(), Error> {
         let admin: Address = env
             .storage()
@@ -886,7 +926,7 @@ impl TreasuryContract {
         if *caller != admin {
             return Err(Error::Unauthorized);
         }
-        Ok(())
+        Self::require_acl_admin_or_above(env, caller)
     }
 
     fn require_signer(env: &Env, caller: &Address) -> Result<(), Error> {
@@ -896,12 +936,17 @@ impl TreasuryContract {
             .get(&DataKey::Signers)
             .unwrap_or(Vec::new(env));
 
+        let mut is_signer = false;
         for i in 0..signers.len() {
             if signers.get(i).unwrap() == *caller {
-                return Ok(());
+                is_signer = true;
+                break;
             }
         }
-        Err(Error::NotASigner)
+        if !is_signer {
+            return Err(Error::NotASigner);
+        }
+        Ok(())
     }
 }
 
@@ -916,34 +961,46 @@ mod test {
     use super::*;
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::Env;
+    use stellar_sentinel_access_control::{
+        AccessControlContract, AccessControlContractClient,
+    };
 
-    fn setup_contract() -> (Env, Address, TreasuryContractClient<'static>) {
+    fn deploy_acl(env: &Env, owner: &Address) -> Address {
+        let acl_id = env.register_contract(None, AccessControlContract);
+        let acl_client = AccessControlContractClient::new(env, &acl_id);
+        acl_client.initialize(owner);
+        acl_id
+    }
+
+    fn setup_contract() -> (Env, Address, Address, TreasuryContractClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, crate::TreasuryContract);
         let client = TreasuryContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-        (env, admin, client)
+        let acl_id = deploy_acl(&env, &admin);
+        (env, admin, acl_id, client)
     }
 
     fn setup_contract_with_token(
         init_balance: i128,
-    ) -> (Env, Address, TreasuryContractClient<'static>, soroban_sdk::Address) {
+    ) -> (Env, Address, Address, TreasuryContractClient<'static>, soroban_sdk::Address) {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
+        let acl_id = deploy_acl(&env, &admin);
         let asset_contract = env.register_stellar_asset_contract_v2(admin.clone());
         let asset = asset_contract.address();
         let contract_id = env.register_contract(None, crate::TreasuryContract);
         let client = TreasuryContractClient::new(&env, &contract_id);
         let sac_client = token::StellarAssetClient::new(&env, &asset);
         sac_client.mint(&contract_id, &init_balance);
-        (env, admin, client, asset)
+        (env, admin, acl_id, client, asset)
     }
 
     #[test]
     fn test_initialize() {
-        let (env, admin, client) = setup_contract();
+        let (env, admin, acl_id, client) = setup_contract();
 
         let signer1 = Address::generate(&env);
         let signer2 = Address::generate(&env);
@@ -956,7 +1013,7 @@ mod test {
             [signer1.clone(), signer2.clone(), signer3.clone()],
         );
 
-        client.initialize(&admin, &asset, &2, &signers);
+        client.initialize(&admin, &asset, &2, &signers, &acl_id);
 
         let config = client.get_config();
         assert_eq!(config.admin, admin);
@@ -968,12 +1025,12 @@ mod test {
 
     #[test]
     fn test_deposit() {
-        let (env, admin, client) = setup_contract();
+        let (env, admin, acl_id, client) = setup_contract();
 
         let signer1 = Address::generate(&env);
         let asset = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
-        client.initialize(&admin, &asset, &1, &signers);
+        client.initialize(&admin, &asset, &1, &signers, &acl_id);
 
         let depositor = Address::generate(&env);
         client.deposit(&depositor, &1_000_000);
@@ -983,12 +1040,12 @@ mod test {
 
     #[test]
     fn test_propose_and_approve() {
-        let (env, admin, client, asset) = setup_contract_with_token(5_000_000);
+        let (env, admin, acl_id, client, asset) = setup_contract_with_token(5_000_000);
 
         let signer1 = Address::generate(&env);
         let signer2 = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone(), signer2.clone()]);
-        client.initialize(&admin, &asset, &2, &signers);
+        client.initialize(&admin, &asset, &2, &signers, &acl_id);
 
         // Deposit some funds
         client.deposit(&signer1, &5_000_000);
@@ -1022,64 +1079,64 @@ mod test {
     #[test]
     #[should_panic(expected = "HostError: Error(Contract, #19)")]
     fn test_duplicate_signer_rejected() {
-        let (env, admin, client) = setup_contract();
+        let (env, admin, acl_id, client) = setup_contract();
         let signer1 = Address::generate(&env);
         let asset = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone(), signer1.clone()]);
         
-        client.initialize(&admin, &asset, &1, &signers);
+        client.initialize(&admin, &asset, &1, &signers, &acl_id);
     }
 
     #[test]
     #[should_panic(expected = "HostError: Error(Contract, #2)")]
     fn test_already_initialized() {
-        let (env, admin, client) = setup_contract();
+        let (env, admin, acl_id, client) = setup_contract();
         let signer1 = Address::generate(&env);
         let asset = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
         
-        client.initialize(&admin, &asset, &1, &signers);
+        client.initialize(&admin, &asset, &1, &signers, &acl_id);
         // Attempt re-initialization
         let new_asset = Address::generate(&env);
-        client.initialize(&admin, &new_asset, &1, &signers);
+        client.initialize(&admin, &new_asset, &1, &signers, &acl_id);
     }
 
     #[test]
     #[should_panic(expected = "HostError: Error(Contract, #6)")]
     fn test_invalid_threshold_zero() {
-        let (env, admin, client) = setup_contract();
+        let (env, admin, acl_id, client) = setup_contract();
         let signer1 = Address::generate(&env);
         let asset = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
         
-        client.initialize(&admin, &asset, &0, &signers);
+        client.initialize(&admin, &asset, &0, &signers, &acl_id);
     }
 
     #[test]
     #[should_panic(expected = "HostError: Error(Contract, #6)")]
     fn test_invalid_threshold_exceeds_signers() {
-        let (env, admin, client) = setup_contract();
+        let (env, admin, acl_id, client) = setup_contract();
         let signer1 = Address::generate(&env);
         let asset = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
         
-        client.initialize(&admin, &asset, &2, &signers);
+        client.initialize(&admin, &asset, &2, &signers, &acl_id);
     }
 
     #[test]
     #[should_panic(expected = "HostError: Error(Contract, #1)")]
     fn test_storage_lifecycle_not_initialized_deposit() {
-        let (env, _, client) = setup_contract();
+        let (env, _, _, client) = setup_contract();
         let depositor = Address::generate(&env);
         client.deposit(&depositor, &100);
     }
 
     #[test]
     fn test_invariant_balance_tracking() {
-        let (env, admin, client, asset) = setup_contract_with_token(1_500);
+        let (env, admin, acl_id, client, asset) = setup_contract_with_token(1_500);
         let signer1 = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
-        client.initialize(&admin, &asset, &1, &signers);
+        client.initialize(&admin, &asset, &1, &signers, &acl_id);
 
         assert_eq!(client.get_balance(), 0);
 
@@ -1100,11 +1157,11 @@ mod test {
     #[test]
     #[should_panic(expected = "HostError: Error(Contract, #5)")]
     fn test_invariant_insufficient_funds_proposal() {
-        let (env, admin, client) = setup_contract();
+        let (env, admin, acl_id, client) = setup_contract();
         let signer1 = Address::generate(&env);
         let asset = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
-        client.initialize(&admin, &asset, &1, &signers);
+        client.initialize(&admin, &asset, &1, &signers, &acl_id);
 
         let recipient = Address::generate(&env);
         client.propose_withdrawal(&signer1, &recipient, &100, &symbol_short!("pay"), &2000);
@@ -1112,12 +1169,12 @@ mod test {
 
     #[test]
     fn test_event_emission_coverage() {
-        let (env, admin, client, asset) = setup_contract_with_token(500);
+        let (env, admin, acl_id, client, asset) = setup_contract_with_token(500);
         let signer1 = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
         
         let events_before_init = env.events().all().len();
-        client.initialize(&admin, &asset, &1, &signers);
+        client.initialize(&admin, &asset, &1, &signers, &acl_id);
         let events_after_init = env.events().all().len();
         assert!(events_after_init > events_before_init);
 
@@ -1139,11 +1196,11 @@ mod test {
     #[test]
     #[should_panic(expected = "HostError: Error(Contract, #12)")]
     fn test_invariant_threshold_breach_prevention() {
-        let (env, admin, client) = setup_contract();
+        let (env, admin, acl_id, client) = setup_contract();
         let signer1 = Address::generate(&env);
         let asset = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
-        client.initialize(&admin, &asset, &1, &signers);
+        client.initialize(&admin, &asset, &1, &signers, &acl_id);
 
         // Cannot remove the only signer as it breaches the threshold
         client.remove_signer(&admin, &signer1);
@@ -1155,6 +1212,7 @@ mod test {
         env.mock_all_auths();
 
         let admin = Address::generate(&env);
+        let acl_id = deploy_acl(&env, &admin);
         let signer1 = Address::generate(&env);
         let signer2 = Address::generate(&env);
         let recipient = Address::generate(&env);
@@ -1165,7 +1223,7 @@ mod test {
         let contract_id = env.register_contract(None, TreasuryContract);
         let client = TreasuryContractClient::new(&env, &contract_id);
 
-        client.initialize(&admin, &asset, &2, &signers);
+        client.initialize(&admin, &asset, &2, &signers, &acl_id);
 
         let token_client = token::Client::new(&env, &asset);
         let sac_client = token::StellarAssetClient::new(&env, &asset);
@@ -1204,6 +1262,7 @@ mod test {
         env.mock_all_auths();
 
         let admin = Address::generate(&env);
+        let acl_id = deploy_acl(&env, &admin);
         let signer1 = Address::generate(&env);
         let signer2 = Address::generate(&env);
         let recipient = Address::generate(&env);
@@ -1214,7 +1273,7 @@ mod test {
         let contract_id = env.register_contract(None, TreasuryContract);
         let client = TreasuryContractClient::new(&env, &contract_id);
 
-        client.initialize(&admin, &asset, &2, &signers);
+        client.initialize(&admin, &asset, &2, &signers, &acl_id);
 
         let sac_client = token::StellarAssetClient::new(&env, &asset);
         sac_client.mint(&contract_id, &5_000_000);
@@ -1247,6 +1306,7 @@ mod test {
         env.mock_all_auths();
 
         let admin = Address::generate(&env);
+        let acl_id = deploy_acl(&env, &admin);
         let signer1 = Address::generate(&env);
         let signer2 = Address::generate(&env);
         let recipient = Address::generate(&env);
@@ -1257,7 +1317,7 @@ mod test {
         let contract_id = env.register_contract(None, TreasuryContract);
         let client = TreasuryContractClient::new(&env, &contract_id);
 
-        client.initialize(&admin, &asset, &2, &signers);
+        client.initialize(&admin, &asset, &2, &signers, &acl_id);
 
         let sac_client = token::StellarAssetClient::new(&env, &asset);
         sac_client.mint(&contract_id, &5_000_000);
@@ -1295,6 +1355,7 @@ mod test {
         env.mock_all_auths();
 
         let admin = Address::generate(&env);
+        let acl_id = deploy_acl(&env, &admin);
         let signer1 = Address::generate(&env);
         let signer2 = Address::generate(&env);
         let recipient = Address::generate(&env);
@@ -1305,7 +1366,7 @@ mod test {
         let contract_id = env.register_contract(None, TreasuryContract);
         let client = TreasuryContractClient::new(&env, &contract_id);
 
-        client.initialize(&admin, &asset, &2, &signers);
+        client.initialize(&admin, &asset, &2, &signers, &acl_id);
 
         let sac_client = token::StellarAssetClient::new(&env, &asset);
         sac_client.mint(&contract_id, &5_000_000);
@@ -1342,6 +1403,7 @@ mod test {
         env.mock_all_auths();
 
         let admin = Address::generate(&env);
+        let acl_id = deploy_acl(&env, &admin);
         let signer1 = Address::generate(&env);
         let signer2 = Address::generate(&env);
         let recipient = Address::generate(&env);
@@ -1352,7 +1414,7 @@ mod test {
         let contract_id = env.register_contract(None, TreasuryContract);
         let client = TreasuryContractClient::new(&env, &contract_id);
 
-        client.initialize(&admin, &asset, &2, &signers);
+        client.initialize(&admin, &asset, &2, &signers, &acl_id);
 
         let sac_client = token::StellarAssetClient::new(&env, &asset);
         sac_client.mint(&contract_id, &1_000_000);

@@ -17,8 +17,12 @@ fn setup(
 ) {
     let env = new_env();
     let admin = soroban_sdk::testutils::Address::generate(&env);
+    let (acl_id, acl) = deploy_acl(&env, &admin);
     let members = addrs(&env, n_members);
-    let c = deploy_governance(&env, &admin, &svec(&env, &members), quorum, period);
+    for m in &members {
+        acl.assign_role(&admin, m, &Role::Member);
+    }
+    let c = deploy_governance(&env, &admin, &svec(&env, &members), quorum, period, &acl_id);
     (env, admin, members, c)
 }
 

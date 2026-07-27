@@ -1325,6 +1325,7 @@ name = "stellar-sentinel-governance"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",
+ "stellar-sentinel-access-control",
 ]
 
 [[package]]
@@ -1343,6 +1344,7 @@ name = "stellar-sentinel-token-vault"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",
+ "stellar-sentinel-access-control",
 ]
 
 [[package]]
@@ -1350,6 +1352,7 @@ name = "stellar-sentinel-treasury"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",
+ "stellar-sentinel-access-control",
 ]
 
 [[package]]
