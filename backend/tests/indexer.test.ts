@@ -240,3 +240,102 @@ describe('Indexer — full lifecycle reconstruction', () => {
     expect(events.length).toBeGreaterThanOrEqual(1);
   });
 });
+
+describe('Indexer — gap detection and backfill', () => {
+  let db: Db;
+  beforeEach(() => { db = new Db(':memory:'); });
+  afterEach(() => { db.close(); });
+
+  test('detects a gap when ledger sequence jumps', () => {
+    ingest(db, makeTreasuryDepositEvent(SIGNER1, 1_000n, 1_000n, '1001'));
+    ingest(db, makeTreasuryDepositEvent(SIGNER2, 500n, 1_500n, '1010'));
+
+    const gaps = db.getOpenGaps(CONTRACT_ID);
+    // Gap between 1001 and 1010 should be recorded
+    const relevantGaps = gaps.filter((g) => g.gap_start >= 1002 && g.gap_end <= 1009);
+    expect(relevantGaps.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test('no gap when ledgers are sequential', () => {
+    ingest(db, makeTreasuryDepositEvent(SIGNER1, 1_000n, 1_000n, '1001'));
+    ingest(db, makeTreasuryDepositEvent(SIGNER2, 500n, 1_500n, '1002'));
+
+    const gaps = db.getOpenGaps(CONTRACT_ID);
+    const relevantGaps = gaps.filter((g) => g.contract_id === CONTRACT_ID);
+    // Should have no gaps for the range 1001→1002 since events are sequential
+    expect(relevantGaps.length).toBe(0);
+  });
+
+  test('gap can be marked backfilled', () => {
+    db.detectGap(CONTRACT_ID, 1005, 1010);
+
+    const gaps = db.getOpenGaps(CONTRACT_ID);
+    expect(gaps.length).toBe(1);
+    expect(gaps[0].backfilled).toBe(0);
+
+    db.markGapBackfilled(gaps[0].id);
+    const openGaps = db.getOpenGaps(CONTRACT_ID);
+    expect(openGaps.length).toBe(0);
+  });
+});
+
+describe('Indexer — re-org resilience', () => {
+  let db: Db;
+  beforeEach(() => { db = new Db(':memory:'); });
+  afterEach(() => { db.close(); });
+
+  test('new event at already-seen ledger is handled via idempotency', () => {
+    const first = makeTreasuryDepositEvent(SIGNER1, 1_000n, 1_000n, '1001');
+    ingest(db, first);
+
+    // Simulate re-org: same ledger, different event ID
+    const reorgEvent = makeTreasuryDepositEvent(SIGNER2, 2_000n, 3_000n, '1001');
+    reorgEvent.id = 'reorg_event_001';
+    reorgEvent.txHash = 'reorg_tx_001';
+
+    // Store the reorg event via insertEvent + handle
+    const result = parseEvent(reorgEvent, 'treasury');
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const inserted = db.insertEvent(result.event);
+    expect(inserted).toBe(true);
+    if (inserted) handleTreasuryEvent(db, result.event);
+
+    // Both events should exist (different event_ids)
+    const events = db.getEventsByContract(CONTRACT_ID, 100, 0);
+    expect(events.length).toBe(2);
+  });
+
+  test('exact duplicate event from re-org is skipped', () => {
+    const raw = makeTreasuryDepositEvent(SIGNER1, 1_000n, 1_000n, '1001');
+    ingest(db, raw);
+
+    // Same event delivered again (replay)
+    ingest(db, raw);
+
+    const events = db.getEventsByContract(CONTRACT_ID, 100, 0);
+    expect(events.length).toBe(1);
+  });
+});
+
+describe('Indexer — halt state', () => {
+  let db: Db;
+  beforeEach(() => { db = new Db(':memory:'); });
+  afterEach(() => { db.close(); });
+
+  test('indexer starts not halted', () => {
+    expect(db.isHalted()).toBe(false);
+  });
+
+  test('halt is set and cleared', () => {
+    db.haltIndexer('Test divergence', 9999);
+    expect(db.isHalted()).toBe(true);
+
+    const status = db.getIndexerStatus();
+    expect(status.halt_reason).toContain('Test divergence');
+    expect(status.last_healthy_ledger).toBe(9999);
+
+    db.clearHalt();
+    expect(db.isHalted()).toBe(false);
+  });
+});

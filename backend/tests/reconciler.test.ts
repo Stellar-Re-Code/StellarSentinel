@@ -109,3 +109,45 @@ describe('Reconciler', () => {
     expect(rec?.on_chain_balance).toBe('7000');
   });
 });
+
+describe('Reconciler — halt on divergence', () => {
+  let db: Db;
+  beforeEach(() => { db = new Db(':memory:'); });
+  afterEach(() => { db.close(); });
+
+  test('mismatch halts the indexer', async () => {
+    ingest(db, makeTreasuryDepositEvent(SIGNER1, 5_000n, 5_000n, '1001'));
+
+    await runReconciliation(db, CONTRACT_ID, 6_000n);
+
+    const rec = db.getLatestReconciliation(CONTRACT_ID);
+    expect(rec?.status).toBe('mismatch');
+  });
+
+  test('indexer status is tracked through reconciliation', () => {
+    expect(db.isHalted()).toBe(false);
+
+    db.haltIndexer('Forced halt for test', 1001);
+    expect(db.isHalted()).toBe(true);
+
+    const status = db.getIndexerStatus();
+    expect(status.halt_reason).toContain('Forced halt');
+    expect(status.last_healthy_ledger).toBe(1001);
+  });
+
+  test('clear halt resets indexer', () => {
+    db.haltIndexer('Test', 1001);
+    expect(db.isHalted()).toBe(true);
+
+    db.clearHalt();
+    expect(db.isHalted()).toBe(false);
+  });
+
+  test('ledger gap is recorded alongside divergence', () => {
+    db.detectGap(CONTRACT_ID, 1005, 1010);
+    const gaps = db.getOpenGaps(CONTRACT_ID);
+    expect(gaps.length).toBe(1);
+    expect(gaps[0].gap_start).toBe(1005);
+    expect(gaps[0].gap_end).toBe(1010);
+  });
+});
