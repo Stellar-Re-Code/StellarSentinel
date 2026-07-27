@@ -86,18 +86,7 @@ export class Indexer {
       : Math.max(this.config.startLedger, 1);
 
     // Detect gap from last known ledger
-    if (checkpoint) {
-      for (const cid of contractIds) {
-        const maxSeen = this.lastSeenLedgers.get(cid);
-        if (maxSeen !== undefined && startLedger > maxSeen + 1) {
-          const gapSize = startLedger - maxSeen - 1;
-          if (gapSize > MAX_LEDGER_SKIP_BEFORE_GAP) {
-            this.db.detectGap(cid, maxSeen + 1, startLedger - 1);
-            console.warn(`[indexer] GAP detected for ${cid}: ledgers ${maxSeen + 1} → ${startLedger - 1} (${gapSize} ledgers)`);
-          }
-        }
-      }
-    }
+    this.checkForGaps();
 
     const eventsResp = await this.server.getEvents({
       startLedger,
@@ -191,6 +180,33 @@ export class Indexer {
     }
 
     return ingested;
+  }
+
+  checkForGaps(): void {
+    const contractIds = [...this.contractMap.keys()];
+    const checkpoint = this.db.getCheckpoint();
+    if (!checkpoint) return;
+
+    const startLedger = checkpoint.last_ledger + 1;
+
+    for (const cid of contractIds) {
+      const maxSeen = this.lastSeenLedgers.get(cid);
+      if (maxSeen !== undefined && startLedger > maxSeen + 1) {
+        const gapSize = startLedger - maxSeen - 1;
+        if (gapSize > MAX_LEDGER_SKIP_BEFORE_GAP) {
+          this.db.detectGap(cid, maxSeen + 1, startLedger - 1);
+          console.warn(`[indexer] GAP detected for ${cid}: ledgers ${maxSeen + 1} → ${startLedger - 1} (${gapSize} ledgers)`);
+        }
+      }
+    }
+  }
+
+  setLastSeenLedger(contractId: string, ledger: number): void {
+    this.lastSeenLedgers.set(contractId, ledger);
+  }
+
+  getLastSeenLedger(contractId: string): number | undefined {
+    return this.lastSeenLedgers.get(contractId);
   }
 
   private dispatchHandler(contractType: ContractType, event: import('../types/events').ParsedEvent): void {

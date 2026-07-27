@@ -5,6 +5,7 @@ export interface ReconcilerOptions {
   rpcUrl: string;
   networkPassphrase: string;
   treasuryContractId: string;
+  onChainBalanceGetter?: () => Promise<{ balance: string; ledger: number }>;
 }
 
 export class Reconciler {
@@ -25,7 +26,9 @@ export class Reconciler {
     let onChainBalance: string;
     let latestLedger: number;
     try {
-      const result = await this.fetchOnChainBalance();
+      const result = this.opts.onChainBalanceGetter
+        ? await this.opts.onChainBalanceGetter()
+        : await this.fetchOnChainBalance();
       onChainBalance = result.balance;
       latestLedger = result.ledger;
     } catch (err) {
