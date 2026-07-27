@@ -339,6 +339,62 @@ test("expiry invalidates approval and execution", () => {
   }, /expired/);
 });
 
+test("getProposalStatus derives correct status in priority order", () => {
+  const config: TreasuryConfig = {
+    admin: "GA_A",
+    threshold: 2,
+    signerCount: 3,
+    balance: 5000,
+    txCount: 1,
+    policyVersion: 2,
+  };
+
+  const baseTx = (overrides: Partial<TreasuryTransaction>): TreasuryTransaction => ({
+    id: 1,
+    to: "GA_DEST",
+    amount: 1000,
+    memo: "Test",
+    approvals: [],
+    executed: false,
+    canceled: false,
+    created_at: 100000,
+    expires_at: 200000,
+    proposer: "GA_A",
+    policy_version: 1,
+    ...overrides,
+  });
+
+  const getProposalStatus = (tx: TreasuryTransaction, cfg: TreasuryConfig | null, now: number) => {
+    if (tx.executed) return "Executed";
+    if (tx.canceled) return "Canceled";
+    if (now > tx.expires_at) return "Expired";
+    if (cfg && tx.policy_version !== cfg.policyVersion) return "Stale Policy";
+    if (cfg && tx.approvals.length >= cfg.threshold) return "Ready";
+    return "Pending";
+  };
+
+  // Executed takes priority
+  assert.equal(getProposalStatus(baseTx({ executed: true, canceled: true }), config, 150000), "Executed");
+
+  // Canceled takes priority over expired
+  assert.equal(getProposalStatus(baseTx({ canceled: true, expires_at: 1 }), config, 999999), "Canceled");
+
+  // Expired takes priority over stale policy and ready
+  assert.equal(getProposalStatus(baseTx({ expires_at: 100, approvals: ["GA_A", "GA_B"] }), config, 999999), "Expired");
+
+  // Stale policy takes priority over ready
+  assert.equal(getProposalStatus(baseTx({ approvals: ["GA_A", "GA_B"] }), config, 150000), "Stale Policy");
+
+  // Ready when threshold met
+  assert.equal(getProposalStatus(baseTx({ approvals: ["GA_A", "GA_B"], policy_version: 2 }), config, 150000), "Ready");
+
+  // Pending when no conditions match
+  assert.equal(getProposalStatus(baseTx({ policy_version: 2 }), config, 150000), "Pending");
+
+  // Null config returns Pending (edge case)
+  assert.equal(getProposalStatus(baseTx(), null, 150000), "Pending");
+});
+
 test("policy change invalidates pending proposals", () => {
   const configWithStalePolicy: TreasuryConfig = {
     admin: "GA_A",
