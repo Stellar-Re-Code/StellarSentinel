@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useFreighter } from "@/context/FreighterProvider";
 import { useTreasury, TreasuryTransaction } from "@/hooks/useTreasury";
+import { useCountdown } from "@/hooks/useCountdown";
 import { Toaster, toast } from "react-hot-toast";
 
 export default function TreasuryPage() {
@@ -40,6 +41,27 @@ export default function TreasuryPage() {
   } | null>(null);
 
   const [actionLoading, setActionLoading] = useState(false);
+
+  const Tooltip = ({ text, children }: { text: string; children: React.ReactNode }) => (
+    <div className="relative group">
+      {children}
+      <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 hidden group-hover:block z-50">
+        <div className="bg-gray-900 text-gray-200 text-xs rounded px-2 py-1 whitespace-nowrap border border-gray-700 shadow-lg">
+          {text}
+        </div>
+        <div className="border-l-4 border-r-4 border-t-4 border-transparent border-t-gray-900 w-0 h-0 mx-auto" />
+      </div>
+    </div>
+  );
+
+  const ExpiryCountdown = ({ expiresAt }: { expiresAt: number }) => {
+    const { formatted, isExpired } = useCountdown(expiresAt);
+    return (
+      <div className={`text-[11px] ${isExpired ? "text-orange-400 font-semibold" : "text-gray-500"}`}>
+        {isExpired ? "Expired" : formatted}
+      </div>
+    );
+  };
 
   const formatXLM = (stroops: number): string => {
     return (stroops / 10_000_000).toLocaleString(undefined, {
@@ -395,44 +417,68 @@ export default function TreasuryPage() {
                       </div>
                     </div>
 
-                    {/* Expiry metadata */}
-                    <div className="text-[11px] text-gray-500">
-                      Created: {new Date(tx.created_at * 1000).toLocaleString()} | Expires:{" "}
-                      {new Date(tx.expires_at * 1000).toLocaleString()}
-                    </div>
+                    {/* Expiry metadata with countdown */}
+                    <ExpiryCountdown expiresAt={tx.expires_at} />
                   </div>
 
                   {/* Actions */}
                   <div className="flex flex-wrap gap-2 w-full lg:w-auto">
                     {/* Approve button */}
-                    {status === "Pending" && isSigner(address) && !hasSigned && (
+                    {isSigner(address) && !hasSigned && (status === "Pending" ? (
                       <button
                         onClick={() => setPreviewAction({ type: "approve", tx })}
                         className="btn-primary text-xs py-1.5 px-3"
                       >
                         Sign Approval
                       </button>
-                    )}
+                    ) : (
+                      <Tooltip text={status === "Expired" ? "Transaction has expired" : "Policy invalidated — will not execute"}>
+                        <button
+                          disabled
+                          className="btn-primary text-xs py-1.5 px-3 opacity-40 cursor-not-allowed"
+                        >
+                          Sign Approval
+                        </button>
+                      </Tooltip>
+                    ))}
 
                     {/* Revoke button */}
-                    {status === "Pending" && isSigner(address) && hasSigned && (
+                    {isSigner(address) && hasSigned && (status === "Pending" ? (
                       <button
                         onClick={() => setPreviewAction({ type: "revoke", tx })}
                         className="px-3 py-1.5 bg-red-950/40 border border-red-900 text-red-400 hover:bg-red-900/40 rounded text-xs transition-colors"
                       >
                         Revoke Approval
                       </button>
-                    )}
+                    ) : (
+                      <Tooltip text={status === "Expired" ? "Transaction has expired" : "Policy invalidated — will not execute"}>
+                        <button
+                          disabled
+                          className="px-3 py-1.5 bg-red-950/40 border border-red-900 text-red-400 rounded text-xs opacity-40 cursor-not-allowed"
+                        >
+                          Revoke Approval
+                        </button>
+                      </Tooltip>
+                    ))}
 
                     {/* Execute button */}
-                    {status === "Ready" && (
+                    {(status === "Ready" ? (
                       <button
                         onClick={() => setPreviewAction({ type: "execute", tx })}
                         className="btn-primary text-xs py-1.5 px-4 bg-green-600 hover:bg-green-700 shadow-md shadow-green-600/25 border-green-800"
                       >
                         Execute Transfer
                       </button>
-                    )}
+                    ) : status === "Pending" && !isEligible ? null : (
+                      <Tooltip text={status === "Expired" ? "Transaction has expired" : "Policy invalidated — will not execute"}>
+                        <button
+                          disabled
+                          className="btn-primary text-xs py-1.5 px-4 bg-green-600 opacity-40 cursor-not-allowed border-green-800"
+                        >
+                          Execute Transfer
+                        </button>
+                      </Tooltip>
+                    ))}
 
                     {/* Cancel button */}
                     {(status === "Pending" || status === "Ready") &&
