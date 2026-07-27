@@ -14,10 +14,11 @@ fn setup() -> (
 ) {
     let env = new_env();
     let admin = soroban_sdk::testutils::Address::generate(&env);
+    let (acl_id, _acl) = deploy_acl(&env, &admin);
     let signers = addrs(&env, 3);
     let asset = soroban_sdk::testutils::Address::generate(&env);
     let recipient = soroban_sdk::testutils::Address::generate(&env);
-    let c = deploy_treasury(&env, &admin, &asset, 2, &svec(&env, &signers));
+    let c = deploy_treasury(&env, &admin, &asset, 2, &svec(&env, &signers), &acl_id);
     (env, admin, signers, recipient, c)
 }
 

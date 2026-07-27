@@ -1,10 +1,15 @@
 #![no_std]
 
+#[cfg(any(test, feature = "testutils"))]
+extern crate std;
+
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, symbol_short,
     Address, Env, Symbol, Vec,
     log,
 };
+
+use stellar_sentinel_access_control::AccessControlContractClient;
 
 // ============================================================================
 // Error Codes
@@ -69,6 +74,8 @@ pub enum DataKey {
     Vesting(u64),
     /// Total locked amount.
     TotalLocked,
+    /// The access-control contract address for RBAC enforcement.
+    AclAddress,
 }
 
 /// A token lock entry.
@@ -142,14 +149,21 @@ impl TokenVaultContract {
     /// * `admin` - The admin address.
     /// * `emergency_signers` - Addresses that can approve emergency unlocks.
     /// * `emergency_threshold` - Number of approvals needed for emergency unlock.
+    /// * `acl_address` - The access-control contract address for RBAC enforcement.
     pub fn initialize(
         env: Env,
         admin: Address,
         emergency_signers: Vec<Address>,
         emergency_threshold: u32,
+        acl_address: Address,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
+        }
+
+        let acl_client = AccessControlContractClient::new(&env, &acl_address);
+        if !acl_client.is_admin_or_above(&admin) {
+            return Err(Error::Unauthorized);
         }
 
         admin.require_auth();
@@ -171,6 +185,7 @@ impl TokenVaultContract {
         env.storage()
             .instance()
             .set(&DataKey::TotalLocked, &0_i128);
+        env.storage().instance().set(&DataKey::AclAddress, &acl_address);
 
         env.events().publish(
             (symbol_short!("vault"), symbol_short!("init")),
@@ -343,6 +358,8 @@ impl TokenVaultContract {
         if !is_emergency_signer {
             return Err(Error::Unauthorized);
         }
+
+        Self::require_acl_member_or_above(&env, &signer)?;
 
         // Check lock exists and isn't claimed
         let lock: TokenLock = env
@@ -657,6 +674,8 @@ impl TokenVaultContract {
 
         current_admin.require_auth();
 
+        Self::require_acl_admin_or_above(&env, &new_admin)?;
+
         env.storage()
             .instance()
             .set(&DataKey::Admin, &new_admin);
@@ -695,6 +714,31 @@ impl TokenVaultContract {
         Ok(())
     }
 
+    fn get_acl(env: &Env) -> Result<AccessControlContractClient, Error> {
+        let acl_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AclAddress)
+            .ok_or(Error::NotInitialized)?;
+        Ok(AccessControlContractClient::new(env, &acl_address))
+    }
+
+    fn require_acl_admin_or_above(env: &Env, caller: &Address) -> Result<(), Error> {
+        let acl = Self::get_acl(env)?;
+        if !acl.is_admin_or_above(caller) {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
+
+    fn require_acl_member_or_above(env: &Env, caller: &Address) -> Result<(), Error> {
+        let acl = Self::get_acl(env)?;
+        if !acl.is_member_or_above(caller) {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
+
     fn require_admin(env: &Env, caller: &Address) -> Result<(), Error> {
         let admin: Address = env
             .storage()
@@ -704,7 +748,7 @@ impl TokenVaultContract {
         if *caller != admin {
             return Err(Error::Unauthorized);
         }
-        Ok(())
+        Self::require_acl_admin_or_above(env, caller)
     }
 }
 
@@ -717,24 +761,40 @@ mod test {
     use super::*;
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::Env;
+    use stellar_sentinel_access_control::{
+        AccessControlContract, AccessControlContractClient, Role,
+    };
 
-    fn setup_contract() -> (Env, Address, TokenVaultContractClient<'static>) {
+    fn deploy_acl(env: &Env, owner: &Address) -> Address {
+        let acl_id = env.register_contract(None, AccessControlContract);
+        let acl_client = AccessControlContractClient::new(env, &acl_id);
+        acl_client.initialize(owner);
+        acl_id
+    }
+
+    fn assign_role(env: &Env, acl_id: &Address, admin: &Address, target: &Address, role: &Role) {
+        let acl_client = AccessControlContractClient::new(env, acl_id);
+        acl_client.assign_role(admin, target, role);
+    }
+
+    fn setup_contract() -> (Env, Address, Address, TokenVaultContractClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, TokenVaultContract);
         let client = TokenVaultContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-        (env, admin, client)
+        let acl_id = deploy_acl(&env, &admin);
+        (env, admin, acl_id, client)
     }
 
     #[test]
     fn test_initialize() {
-        let (env, admin, client) = setup_contract();
+        let (env, admin, acl_id, client) = setup_contract();
 
         let signer1 = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
 
-        client.initialize(&admin, &signers, &1);
+        client.initialize(&admin, &signers, &1, &acl_id);
 
         let stats = client.get_stats();
         assert_eq!(stats.admin, admin);
@@ -744,11 +804,11 @@ mod test {
 
     #[test]
     fn test_lock_tokens() {
-        let (env, admin, client) = setup_contract();
+        let (env, admin, acl_id, client) = setup_contract();
 
         let signer1 = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
-        client.initialize(&admin, &signers, &1);
+        client.initialize(&admin, &signers, &1, &acl_id);
 
         let owner = Address::generate(&env);
         let lock_id = client.lock_tokens(
@@ -770,11 +830,11 @@ mod test {
 
     #[test]
     fn test_create_vesting() {
-        let (env, admin, client) = setup_contract();
+        let (env, admin, acl_id, client) = setup_contract();
 
         let signer1 = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
-        client.initialize(&admin, &signers, &1);
+        client.initialize(&admin, &signers, &1, &acl_id);
 
         let beneficiary = Address::generate(&env);
         let vesting_id = client.create_vesting(

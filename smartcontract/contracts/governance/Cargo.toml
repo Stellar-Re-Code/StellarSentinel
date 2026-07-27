@@ -9,9 +9,11 @@ doctest = false
 
 [dependencies]
 soroban-sdk = { workspace = true }
+stellar-sentinel-access-control = { path = "../access-control" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+stellar-sentinel-access-control = { path = "../access-control", features = ["testutils"] }
 
 [features]
-testutils = ["soroban-sdk/testutils"]
+testutils = ["soroban-sdk/testutils", "stellar-sentinel-access-control/testutils"]

@@ -36,6 +36,9 @@
 //! - Re-assigning the exact role an address already holds is rejected
 //!   (`RoleAlreadyAssigned`); changing to a different role is allowed and recorded.
 
+#[cfg(any(test, feature = "testutils"))]
+extern crate std;
+
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, symbol_short,
     Address, Env, Vec,

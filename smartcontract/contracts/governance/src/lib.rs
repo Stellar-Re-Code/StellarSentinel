@@ -1,10 +1,15 @@
 #![no_std]
 
+#[cfg(any(test, feature = "testutils"))]
+extern crate std;
+
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, symbol_short,
     Address, Env, Symbol, Vec,
     log,
 };
+
+use stellar_sentinel_access_control::AccessControlContractClient;
 
 // ============================================================================
 // Error Codes
@@ -65,6 +70,8 @@ pub enum DataKey {
     Proposal(u64),
     /// Record of a vote: (proposal_id, voter_address).
     Vote(u64, Address),
+    /// The access-control contract address for RBAC enforcement.
+    AclAddress,
 }
 
 /// The type of action a proposal requests.
@@ -162,15 +169,22 @@ impl GovernanceContract {
     /// * `members` - Initial list of DAO members.
     /// * `quorum_percent` - Minimum vote percentage for quorum (1-100).
     /// * `voting_period` - Duration of voting in ledger sequences.
+    /// * `acl_address` - The access-control contract address for RBAC enforcement.
     pub fn initialize(
         env: Env,
         admin: Address,
         members: Vec<Address>,
         quorum_percent: u32,
         voting_period: u32,
+        acl_address: Address,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::AlreadyInitialized);
+        }
+
+        let acl_client = AccessControlContractClient::new(&env, &acl_address);
+        if !acl_client.is_admin_or_above(&admin) {
+            return Err(Error::Unauthorized);
         }
 
         admin.require_auth();
@@ -187,6 +201,7 @@ impl GovernanceContract {
         env.storage()
             .instance()
             .set(&DataKey::ProposalCounter, &0_u64);
+        env.storage().instance().set(&DataKey::AclAddress, &acl_address);
 
         env.events().publish(
             (symbol_short!("gov"), symbol_short!("init")),
@@ -440,8 +455,14 @@ impl GovernanceContract {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)?;
-        if executor != admin && executor != proposal.proposer {
+        if executor != proposal.proposer && executor != admin {
             return Err(Error::Unauthorized);
+        }
+
+        if executor == admin {
+            Self::require_acl_admin_or_above(&env, &executor)?;
+        } else if executor == proposal.proposer {
+            Self::require_acl_member_or_above(&env, &executor)?;
         }
 
         // Handle member add/remove actions
@@ -591,17 +612,11 @@ impl GovernanceContract {
         new_admin: Address,
     ) -> Result<(), Error> {
         Self::require_initialized(&env)?;
-
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        if current_admin != admin {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_admin(&env, &current_admin)?;
 
         current_admin.require_auth();
+
+        Self::require_acl_admin_or_above(&env, &new_admin)?;
 
         env.storage()
             .instance()
@@ -618,15 +633,7 @@ impl GovernanceContract {
     /// Update the quorum percentage. Admin only.
     pub fn set_quorum(env: Env, admin: Address, new_quorum: u32) -> Result<(), Error> {
         Self::require_initialized(&env)?;
-
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        if admin != stored_admin {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_admin(&env, &admin)?;
 
         admin.require_auth();
 
@@ -649,15 +656,7 @@ impl GovernanceContract {
         new_wasm_hash: soroban_sdk::BytesN<32>,
     ) -> Result<(), Error> {
         Self::require_initialized(&env)?;
-
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        if admin != stored_admin {
-            return Err(Error::Unauthorized);
-        }
+        Self::require_admin(&env, &admin)?;
 
         admin.require_auth();
 
@@ -676,6 +675,31 @@ impl GovernanceContract {
         Ok(())
     }
 
+    fn get_acl(env: &Env) -> Result<AccessControlContractClient, Error> {
+        let acl_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AclAddress)
+            .ok_or(Error::NotInitialized)?;
+        Ok(AccessControlContractClient::new(env, &acl_address))
+    }
+
+    fn require_acl_admin_or_above(env: &Env, caller: &Address) -> Result<(), Error> {
+        let acl = Self::get_acl(env)?;
+        if !acl.is_admin_or_above(caller) {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
+
+    fn require_acl_member_or_above(env: &Env, caller: &Address) -> Result<(), Error> {
+        let acl = Self::get_acl(env)?;
+        if !acl.is_member_or_above(caller) {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
+
     fn require_member(env: &Env, caller: &Address) -> Result<(), Error> {
         let members: Vec<Address> = env
             .storage()
@@ -683,12 +707,29 @@ impl GovernanceContract {
             .get(&DataKey::Members)
             .unwrap_or(Vec::new(env));
 
+        let mut is_member = false;
         for i in 0..members.len() {
             if members.get(i).unwrap() == *caller {
-                return Ok(());
+                is_member = true;
+                break;
             }
         }
-        Err(Error::NotAMember)
+        if !is_member {
+            return Err(Error::NotAMember);
+        }
+        Self::require_acl_member_or_above(env, caller)
+    }
+
+    fn require_admin(env: &Env, caller: &Address) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if *caller != admin {
+            return Err(Error::Unauthorized);
+        }
+        Self::require_acl_admin_or_above(env, caller)
     }
 }
 
@@ -701,25 +742,41 @@ mod test {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::Env;
+    use stellar_sentinel_access_control::{
+        AccessControlContract, AccessControlContractClient, Role,
+    };
 
-    fn setup_contract() -> (Env, Address, GovernanceContractClient<'static>) {
+    fn deploy_acl(env: &Env, owner: &Address) -> Address {
+        let acl_id = env.register_contract(None, AccessControlContract);
+        let acl_client = AccessControlContractClient::new(env, &acl_id);
+        acl_client.initialize(owner);
+        acl_id
+    }
+
+    fn assign_role(env: &Env, acl_id: &Address, admin: &Address, target: &Address, role: &Role) {
+        let acl_client = AccessControlContractClient::new(env, acl_id);
+        acl_client.assign_role(admin, target, role);
+    }
+
+    fn setup_contract() -> (Env, Address, Address, GovernanceContractClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, GovernanceContract);
         let client = GovernanceContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-        (env, admin, client)
+        let acl_id = deploy_acl(&env, &admin);
+        (env, admin, acl_id, client)
     }
 
     #[test]
     fn test_initialize() {
-        let (env, admin, client) = setup_contract();
+        let (env, admin, acl_id, client) = setup_contract();
 
         let member1 = Address::generate(&env);
         let member2 = Address::generate(&env);
         let members = Vec::from_array(&env, [member1.clone(), member2.clone()]);
 
-        client.initialize(&admin, &members, &50, &1000);
+        client.initialize(&admin, &members, &50, &1000, &acl_id);
 
         let config = client.get_config();
         assert_eq!(config.admin, admin);
@@ -730,7 +787,7 @@ mod test {
 
     #[test]
     fn test_create_proposal_and_vote() {
-        let (env, admin, client) = setup_contract();
+        let (env, admin, acl_id, client) = setup_contract();
 
         let member1 = Address::generate(&env);
         let member2 = Address::generate(&env);
@@ -740,7 +797,11 @@ mod test {
             [member1.clone(), member2.clone(), member3.clone()],
         );
 
-        client.initialize(&admin, &members, &50, &1000);
+        assign_role(&env, &acl_id, &admin, &member1, &Role::Member);
+        assign_role(&env, &acl_id, &admin, &member2, &Role::Member);
+        assign_role(&env, &acl_id, &admin, &member3, &Role::Member);
+
+        client.initialize(&admin, &members, &50, &1000, &acl_id);
 
         // Create a funding proposal
         let proposal_id = client.create_proposal(
@@ -765,12 +826,14 @@ mod test {
 
     #[test]
     fn test_has_voted() {
-        let (env, admin, client) = setup_contract();
+        let (env, admin, acl_id, client) = setup_contract();
 
         let member1 = Address::generate(&env);
         let members = Vec::from_array(&env, [member1.clone()]);
 
-        client.initialize(&admin, &members, &50, &1000);
+        assign_role(&env, &acl_id, &admin, &member1, &Role::Member);
+
+        client.initialize(&admin, &members, &50, &1000, &acl_id);
 
         let proposal_id = client.create_proposal(
             &member1,

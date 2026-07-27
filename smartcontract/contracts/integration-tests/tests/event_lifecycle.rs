@@ -13,7 +13,7 @@ use soroban_sdk::{symbol_short, vec, IntoVal};
 fn acl_event_stream_is_complete_and_versioned() {
     let env = new_env();
     let owner = soroban_sdk::testutils::Address::generate(&env);
-    let c = deploy_acl(&env, &owner);
+    let (_, c) = deploy_acl(&env, &owner);
 
     let m = soroban_sdk::testutils::Address::generate(&env);
     let n = soroban_sdk::testutils::Address::generate(&env);
@@ -62,10 +62,11 @@ fn acl_event_stream_is_complete_and_versioned() {
 fn treasury_lifecycle_emits_every_step() {
     let env = new_env();
     let admin = soroban_sdk::testutils::Address::generate(&env);
+    let (acl_id, _acl) = deploy_acl(&env, &admin);
     let signers = addrs(&env, 2);
     let asset = soroban_sdk::testutils::Address::generate(&env);
     let recipient = soroban_sdk::testutils::Address::generate(&env);
-    let c = deploy_treasury(&env, &admin, &asset, 2, &svec(&env, &signers));
+    let c = deploy_treasury(&env, &admin, &asset, 2, &svec(&env, &signers), &acl_id);
 
     let count_before = env.events().all().len(); // init already emitted
     assert!(count_before >= 1, "init event present");

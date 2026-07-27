@@ -98,11 +98,11 @@ pub fn advance_seq(env: &Env, by: u32) {
 // Deployment helpers
 // ---------------------------------------------------------------------------
 
-pub fn deploy_acl(env: &Env, owner: &Address) -> AccessControlContractClient<'static> {
+pub fn deploy_acl(env: &Env, owner: &Address) -> (Address, AccessControlContractClient<'static>) {
     let id = env.register_contract(None, AccessControlContract);
     let c = AccessControlContractClient::new(env, &id);
     c.initialize(owner);
-    c
+    (id, c)
 }
 
 pub fn deploy_treasury(
@@ -111,10 +111,11 @@ pub fn deploy_treasury(
     asset: &Address,
     threshold: u32,
     signers: &Vec<Address>,
+    acl_id: &Address,
 ) -> TreasuryContractClient<'static> {
     let id = env.register_contract(None, TreasuryContract);
     let c = TreasuryContractClient::new(env, &id);
-    c.initialize(admin, asset, &threshold, signers);
+    c.initialize(admin, asset, &threshold, signers, acl_id);
     c
 }
 
@@ -124,10 +125,11 @@ pub fn deploy_governance(
     members: &Vec<Address>,
     quorum_percent: u32,
     voting_period: u32,
+    acl_id: &Address,
 ) -> GovernanceContractClient<'static> {
     let id = env.register_contract(None, GovernanceContract);
     let c = GovernanceContractClient::new(env, &id);
-    c.initialize(admin, members, &quorum_percent, &voting_period);
+    c.initialize(admin, members, &quorum_percent, &voting_period, acl_id);
     c
 }
 
@@ -136,10 +138,11 @@ pub fn deploy_vault(
     admin: &Address,
     emergency_signers: &Vec<Address>,
     emergency_threshold: u32,
+    acl_id: &Address,
 ) -> TokenVaultContractClient<'static> {
     let id = env.register_contract(None, TokenVaultContract);
     let c = TokenVaultContractClient::new(env, &id);
-    c.initialize(admin, emergency_signers, &emergency_threshold);
+    c.initialize(admin, emergency_signers, &emergency_threshold, acl_id);
     c
 }
 
