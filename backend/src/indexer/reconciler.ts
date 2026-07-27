@@ -1,10 +1,11 @@
-import { SorobanRpc, xdr, scValToNative, Address, TransactionBuilder, Networks, Account, Contract, nativeToScVal } from '@stellar/stellar-sdk';
+import { SorobanRpc, xdr, scValToNative, Address } from '@stellar/stellar-sdk';
 import type { Db } from '../db/client';
 
 export interface ReconcilerOptions {
   rpcUrl: string;
   networkPassphrase: string;
   treasuryContractId: string;
+  onChainBalanceGetter?: () => Promise<{ balance: string; ledger: number }>;
 }
 
 export class Reconciler {
@@ -19,14 +20,15 @@ export class Reconciler {
   async reconcile(db: Db): Promise<void> {
     const indexedBalance = db.getLatestBalance(this.opts.treasuryContractId);
     if (indexedBalance === null) {
-      // No events yet — nothing to reconcile
       return;
     }
 
     let onChainBalance: string;
     let latestLedger: number;
     try {
-      const result = await this.fetchOnChainBalance();
+      const result = this.opts.onChainBalanceGetter
+        ? await this.opts.onChainBalanceGetter()
+        : await this.fetchOnChainBalance();
       onChainBalance = result.balance;
       latestLedger = result.ledger;
     } catch (err) {
@@ -46,29 +48,39 @@ export class Reconciler {
     const onChain = BigInt(onChainBalance);
     const discrepancy = onChain - indexed;
 
+    const status = discrepancy === 0n ? 'ok' : 'mismatch';
+
     db.insertReconciliation({
       contract_id: this.opts.treasuryContractId,
       ledger_sequence: latestLedger,
       indexed_balance: indexedBalance,
       on_chain_balance: onChainBalance,
       discrepancy: String(discrepancy),
-      status: discrepancy === 0n ? 'ok' : 'mismatch',
+      status,
       detail: discrepancy !== 0n
-        ? `Indexed balance ${indexedBalance} does not match on-chain balance ${onChainBalance}`
+        ? `Indexed balance ${indexedBalance} does not match on-chain balance ${onChainBalance} (delta=${discrepancy})`
         : null,
     });
 
     if (discrepancy !== 0n) {
-      console.error(
-        `[reconciler] MISMATCH on ${this.opts.treasuryContractId}: ` +
-        `indexed=${indexedBalance} on_chain=${onChainBalance} delta=${discrepancy}`,
+      const msg =
+        `[reconciler] DIVERGENCE on ${this.opts.treasuryContractId}: ` +
+        `indexed=${indexedBalance} on_chain=${onChainBalance} delta=${discrepancy}`;
+      console.error(msg);
+
+      db.haltIndexer(
+        `Balance divergence: ${msg}. Ledger ${latestLedger}. Remediation required.`,
+        latestLedger,
       );
+
+      const gaps = db.getOpenGaps(this.opts.treasuryContractId);
+      if (gaps.length > 0) {
+        console.error(`[reconciler] Open gaps detected: ${gaps.map((g) => `${g.gap_start}→${g.gap_end}`).join(', ')}`);
+      }
     }
   }
 
   private async fetchOnChainBalance(): Promise<{ balance: string; ledger: number }> {
-    // Read the contract instance ledger entry to extract the Balance key.
-    // The balance is stored in instance storage under DataKey::Balance.
     const contractKey = xdr.LedgerKey.contractData(
       new xdr.LedgerKeyContractData({
         contract: new Address(this.opts.treasuryContractId).toScAddress(),
@@ -85,7 +97,6 @@ export class Reconciler {
     const entry = resp.entries[0];
     const ledger = resp.latestLedger;
 
-    // Decode the contract instance data to find the Balance field
     const contractData = entry.val.contractData();
     const instance = contractData.val().instance();
     const storage = instance.storage();
@@ -94,11 +105,8 @@ export class Reconciler {
       throw new Error('Contract instance has no storage');
     }
 
-    // Find the key matching DataKey::Balance — it serializes as ScvVec([ScvSymbol("Balance")])
-    // In Soroban the contracttype enum variant is stored as a ScVec with the variant name
     for (const mapEntry of storage.entries()) {
       const keyNative = scValToNative(mapEntry.key());
-      // DataKey::Balance serializes as the symbol "Balance"
       if (keyNative === 'Balance' || (Array.isArray(keyNative) && keyNative[0] === 'Balance')) {
         const balance = scValToNative(mapEntry.val());
         return { balance: String(balance as bigint), ledger };

@@ -5,7 +5,7 @@ import { runMigrations } from './migrations';
 import type {
   IndexedEventRow, CheckpointRow, QuarantinedEventRow,
   TreasuryProposalRow, TreasuryApprovalRow, BalanceHistoryRow,
-  ReconciliationResultRow, ProposalStatus,
+  ReconciliationResultRow, ProposalStatus, IndexerStatusRow, LedgerGapRow,
 } from '../types/models';
 import type { ParsedEvent } from '../types/events';
 
@@ -246,10 +246,80 @@ export class Db {
       WHERE contract_id = ? ORDER BY id DESC LIMIT 1
     `).get(contractId) as ReconciliationResultRow) ?? null;
   }
+  // ─── Indexer Status ─────────────────────────────────────────────────────────
+
+  getIndexerStatus(): IndexerStatusRow {
+    return this.db.prepare('SELECT * FROM indexer_status WHERE id = 1').get() as IndexerStatusRow;
+  }
+
+  haltIndexer(reason: string, ledger: number): void {
+    this.db.prepare(`
+      UPDATE indexer_status SET halted = 1, halt_reason = ?, last_healthy_ledger = ?, updated_at = datetime('now')
+      WHERE id = 1
+    `).run(reason, ledger);
+  }
+
+  clearHalt(): void {
+    this.db.prepare(`
+      UPDATE indexer_status SET halted = 0, halt_reason = NULL, updated_at = datetime('now')
+      WHERE id = 1
+    `).run();
+  }
+
+  isHalted(): boolean {
+    const row = this.getIndexerStatus();
+    return row.halted === 1;
+  }
+
+  // ─── Ledger Gaps ───────────────────────────────────────────────────────────
+
+  detectGap(contractId: string, gapStart: number, gapEnd: number): boolean {
+    const existing = this.db.prepare(`
+      SELECT id FROM ledger_gaps
+      WHERE contract_id = ? AND gap_start = ? AND gap_end = ? AND backfilled = 0
+    `).get(contractId, gapStart, gapEnd);
+    if (existing) return false;
+
+    this.db.prepare(`
+      INSERT INTO ledger_gaps (contract_id, gap_start, gap_end)
+      VALUES (?, ?, ?)
+    `).run(contractId, gapStart, gapEnd);
+    return true;
+  }
+
+  markGapBackfilled(gapId: number): void {
+    this.db.prepare(`
+      UPDATE ledger_gaps SET backfilled = 1, backfilled_at = datetime('now')
+      WHERE id = ?
+    `).run(gapId);
+  }
+
+  getOpenGaps(contractId: string): LedgerGapRow[] {
+    return this.db.prepare(`
+      SELECT * FROM ledger_gaps
+      WHERE contract_id = ? AND backfilled = 0
+      ORDER BY gap_start ASC
+    `).all(contractId) as LedgerGapRow[];
+  }
+
+  getMinLedgerSequence(contractId: string): number | null {
+    const row = this.db.prepare(`
+      SELECT MIN(ledger_sequence) as min_ledger FROM indexed_events WHERE contract_id = ?
+    `).get(contractId) as { min_ledger: number | null } | undefined;
+    return row?.min_ledger ?? null;
+  }
+
+  getMaxLedgerSequence(contractId: string): number | null {
+    const row = this.db.prepare(`
+      SELECT MAX(ledger_sequence) as max_ledger FROM indexed_events WHERE contract_id = ?
+    `).get(contractId) as { max_ledger: number | null } | undefined;
+    return row?.max_ledger ?? null;
+  }
 
   // ─── Helpers ──────────────────────────────────────────────────────────────
 
   transaction<T>(fn: () => T): T {
     return this.db.transaction(fn)();
   }
+
 }

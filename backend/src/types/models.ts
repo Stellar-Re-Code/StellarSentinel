@@ -133,6 +133,24 @@ export interface BalanceHistoryEntry {
   proposalId: string | null;
 }
 
+export interface IndexerStatusRow {
+  id: number;
+  halted: number;
+  halt_reason: string | null;
+  last_healthy_ledger: number | null;
+  updated_at: string;
+}
+
+export interface LedgerGapRow {
+  id: number;
+  contract_id: string;
+  gap_start: number;
+  gap_end: number;
+  detected_at: string;
+  backfilled: number;
+  backfilled_at: string | null;
+}
+
 export interface TreasuryAuditView {
   contractId: string;
   currentIndexedBalance: string;

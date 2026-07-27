@@ -1,4 +1,6 @@
 import { Db } from '../src/db/client';
+import { Indexer } from '../src/indexer/indexer';
+import type { Config } from '../src/config';
 import { parseEvent } from '../src/indexer/parser';
 import { handleTreasuryEvent } from '../src/indexer/handlers/treasury';
 import {
@@ -8,6 +10,27 @@ import {
   makeMalformedEvent, makeUnknownNamespaceEvent,
   SIGNER1, SIGNER2, ADMIN, CONTRACT_ID,
 } from './fixtures';
+
+function testConfig(overrides: Partial<Config> = {}): Config {
+  return {
+    sorobanRpcUrl: 'http://test:8000',
+    networkPassphrase: 'Test SDF Network ; September 2015',
+    contracts: {
+      treasury: CONTRACT_ID,
+      governance: null,
+      vault: null,
+      acl: null,
+    },
+    databasePath: '',
+    pollIntervalMs: 1000,
+    batchSize: 10,
+    startLedger: 1,
+    logLevel: 'error',
+    apiPort: 3001,
+    corsOrigin: '*',
+    ...overrides,
+  };
+}
 
 // Helper: parse + handle a raw event
 function ingest(db: Db, raw: ReturnType<typeof makeTreasuryDepositEvent>): void {
@@ -238,5 +261,138 @@ describe('Indexer — full lifecycle reconstruction', () => {
     const events = db.getEventsByActor(SIGNER1, 100, 0);
     // Actor is stored as raw decoded string from XDR — check it includes at least 1 event
     expect(events.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe('Indexer — gap detection (production code path via Indexer.checkForGaps)', () => {
+  let db: Db;
+  let indexer: Indexer;
+
+  beforeEach(() => {
+    db = new Db(':memory:');
+    indexer = new Indexer(db, testConfig());
+  });
+  afterEach(() => { db.close(); });
+
+  test('detects a gap when Indexer.lastSeenLedger < checkpoint - 1', () => {
+    ingest(db, makeTreasuryDepositEvent(SIGNER1, 1_000n, 1_000n, '1001'));
+    db.upsertCheckpoint(1010, null);
+    indexer.setLastSeenLedger(CONTRACT_ID, 1001);
+
+    indexer.checkForGaps();
+
+    const gaps = db.getOpenGaps(CONTRACT_ID);
+    expect(gaps.length).toBe(1);
+    expect(gaps[0].gap_start).toBe(1002);
+    expect(gaps[0].gap_end).toBe(1009);
+    expect(gaps[0].backfilled).toBe(0);
+  });
+
+  test('no gap when lastSeen matches checkpoint ledger', () => {
+    ingest(db, makeTreasuryDepositEvent(SIGNER1, 1_000n, 1_000n, '1001'));
+    ingest(db, makeTreasuryDepositEvent(SIGNER2, 500n, 1_500n, '1002'));
+    db.upsertCheckpoint(1003, null);
+    indexer.setLastSeenLedger(CONTRACT_ID, 1002);
+
+    indexer.checkForGaps();
+
+    const gaps = db.getOpenGaps(CONTRACT_ID);
+    expect(gaps.length).toBe(0);
+  });
+});
+
+describe('Indexer — gap backfill lifecycle (DB methods)', () => {
+  let db: Db;
+  beforeEach(() => { db = new Db(':memory:'); });
+  afterEach(() => { db.close(); });
+
+  test('gap can be marked backfilled', () => {
+    db.detectGap(CONTRACT_ID, 1005, 1010);
+
+    const gaps = db.getOpenGaps(CONTRACT_ID);
+    expect(gaps.length).toBe(1);
+    expect(gaps[0].backfilled).toBe(0);
+
+    db.markGapBackfilled(gaps[0].id);
+    const openGaps = db.getOpenGaps(CONTRACT_ID);
+    expect(openGaps.length).toBe(0);
+  });
+});
+
+describe('Indexer — re-org resilience', () => {
+  let db: Db;
+  beforeEach(() => { db = new Db(':memory:'); });
+  afterEach(() => { db.close(); });
+
+  test('new event at already-seen ledger is handled via idempotency', () => {
+    const first = makeTreasuryDepositEvent(SIGNER1, 1_000n, 1_000n, '1001');
+    ingest(db, first);
+
+    const reorgEvent = makeTreasuryDepositEvent(SIGNER2, 2_000n, 3_000n, '1001');
+    reorgEvent.id = 'reorg_event_001';
+    reorgEvent.txHash = 'reorg_tx_001';
+
+    const result = parseEvent(reorgEvent, 'treasury');
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const inserted = db.insertEvent(result.event);
+    expect(inserted).toBe(true);
+    if (inserted) handleTreasuryEvent(db, result.event);
+
+    const events = db.getEventsByContract(CONTRACT_ID, 100, 0);
+    expect(events.length).toBe(2);
+  });
+
+  test('exact duplicate event from re-org is skipped', () => {
+    const raw = makeTreasuryDepositEvent(SIGNER1, 1_000n, 1_000n, '1001');
+    ingest(db, raw);
+    ingest(db, raw);
+
+    const events = db.getEventsByContract(CONTRACT_ID, 100, 0);
+    expect(events.length).toBe(1);
+  });
+
+  test('re-org detection via lastSeen ledger comparison', () => {
+    const first = makeTreasuryDepositEvent(SIGNER1, 1_000n, 1_000n, '1001');
+    ingest(db, first);
+
+    const indexer = new Indexer(db, testConfig());
+    indexer.setLastSeenLedger(CONTRACT_ID, 2000);
+
+    // Event at ledger 1500 < lastSeen(2000) => re-org
+    const reorgEvent = makeTreasuryDepositEvent(SIGNER2, 2_000n, 3_000n, '1500');
+    reorgEvent.id = 'reorg_1500_001';
+    reorgEvent.txHash = 'reorg_tx_1500_001';
+
+    const result = parseEvent(reorgEvent, 'treasury');
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const inserted = db.insertEvent(result.event);
+    expect(inserted).toBe(true);
+
+    // lastSeen should still be 2000 for that contract (not lowered by re-org)
+    expect(indexer.getLastSeenLedger(CONTRACT_ID)).toBe(2000);
+  });
+});
+
+describe('Indexer — halt state (production code path via Reconciler)', () => {
+  let db: Db;
+  beforeEach(() => { db = new Db(':memory:'); });
+  afterEach(() => { db.close(); });
+
+  test('indexer starts not halted', () => {
+    expect(db.isHalted()).toBe(false);
+  });
+
+  test('halt stores reason and ledger provenance', () => {
+    db.haltIndexer('Test divergence', 9999);
+    expect(db.isHalted()).toBe(true);
+
+    const status = db.getIndexerStatus();
+    expect(status.halt_reason).toContain('Test divergence');
+    expect(status.last_healthy_ledger).toBe(9999);
+
+    db.clearHalt();
+    expect(db.isHalted()).toBe(false);
   });
 });

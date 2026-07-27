@@ -97,5 +97,29 @@ export function runMigrations(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_proposals_proposer ON treasury_proposals(proposer);
     CREATE INDEX IF NOT EXISTS idx_approvals_proposal ON treasury_approvals(proposal_id, contract_id);
     CREATE INDEX IF NOT EXISTS idx_balance_contract  ON treasury_balance_history(contract_id, ledger_sequence);
+
+    CREATE TABLE IF NOT EXISTS indexer_status (
+      id          INTEGER PRIMARY KEY CHECK (id = 1),
+      halted      INTEGER NOT NULL DEFAULT 0,
+      halt_reason TEXT,
+      last_healthy_ledger INTEGER,
+      updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    INSERT OR IGNORE INTO indexer_status (id, halted, halt_reason)
+    VALUES (1, 0, NULL);
+
+    CREATE TABLE IF NOT EXISTS ledger_gaps (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      contract_id     TEXT NOT NULL,
+      gap_start       INTEGER NOT NULL,
+      gap_end         INTEGER NOT NULL,
+      detected_at     TEXT NOT NULL DEFAULT (datetime('now')),
+      backfilled      INTEGER NOT NULL DEFAULT 0,
+      backfilled_at   TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_gaps_contract ON ledger_gaps(contract_id);
+    CREATE INDEX IF NOT EXISTS idx_gaps_backfilled ON ledger_gaps(backfilled);
   `);
 }
