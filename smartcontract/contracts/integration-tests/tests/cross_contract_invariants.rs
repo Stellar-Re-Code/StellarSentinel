@@ -34,9 +34,12 @@ fn role_decisions_gate_privileged_treasury_actions() {
     let newbie = soroban_sdk::Address::generate(&env);
     
     let signers = addrs(&env, 2);
-    let asset = soroban_sdk::Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(owner.clone()).address();
     let treasury = deploy_treasury(&env, &owner, &asset, 1, &svec(&env, &signers), &acl_id);
     let gov = deploy_governance(&env, &owner, &svec(&env, &members), 34, 50, &acl_id, &treasury.address);
+    
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &asset);
+    token_admin.mint(&signers[0], &10_000);
     treasury.deposit(&signers[0], &10_000);
 
     assert_eq!(
@@ -145,6 +148,8 @@ fn terminal_operations_cannot_replay_across_contracts() {
     let asset = env.register_stellar_asset_contract_v2(admin.clone()).address();
     let recipient = soroban_sdk::Address::generate(&env);
     let treasury = deploy_treasury(&env, &admin, &asset, 2, &svec(&env, &signers), &acl_id);
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &asset);
+    token_admin.mint(&signers[0], &10_000);
     treasury.deposit(&signers[0], &10_000);
     soroban_sdk::token::StellarAssetClient::new(&env, &asset).mint(&treasury.address, &10_000);
     let exp = env.ledger().timestamp() + 10_000;
