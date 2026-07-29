@@ -1,5 +1,6 @@
 //! Governance security invariants (INV-G1 .. INV-G5).
 
+use soroban_sdk::testutils::Address as _;
 mod common;
 
 use common::*;
@@ -16,7 +17,7 @@ fn setup(
     GovernanceContractClient<'static>,
 ) {
     let env = new_env();
-    let admin = soroban_sdk::testutils::Address::generate(&env);
+    let admin = soroban_sdk::Address::generate(&env);
     let (acl_id, acl) = deploy_acl(&env, &admin);
     let members = addrs(&env, n_members);
     for m in &members {
@@ -67,7 +68,7 @@ fn passed_proposal_executes_once() {
     assert_eq!(p.votes_for + p.votes_against, p.total_votes, "INV-G2 tally consistent");
 
     advance_seq(&env, 200); // past ends_at
-    assert_eq!(c.finalize(&admin, &id), ProposalStatus::Passed);
+    assert_eq!(c.finalize(&members[0], &id), ProposalStatus::Passed);
 
     c.execute_proposal(&admin, &id);
     assert_eq!(c.get_proposal(&id).status, ProposalStatus::Executed);
@@ -87,7 +88,7 @@ fn quorum_not_met_expires() {
     c.vote(&members[0], &id, &true); // only 1 of 3 needed votes
 
     advance_seq(&env, 200);
-    assert_eq!(c.finalize(&admin, &id), ProposalStatus::Expired);
+    assert_eq!(c.finalize(&members[0], &id), ProposalStatus::Expired);
     assert_eq!(
         c.try_execute_proposal(&admin, &id),
         Err(Ok(governance::Error::ProposalRejected))
@@ -101,7 +102,7 @@ fn cannot_vote_after_finalize() {
     let id = mk_proposal(&c, &members[0]);
     c.vote(&members[0], &id, &true);
     advance_seq(&env, 200);
-    c.finalize(&admin, &id);
+    c.finalize(&members[0], &id);
 
     assert_eq!(
         c.try_vote(&members[1], &id, &true),
@@ -137,7 +138,8 @@ fn seeded_operation_sequences() {
                     let count = c.get_config().proposal_count;
                     if count > 0 {
                         let id = rng.below(count) + 1;
-                        let _ = c.try_finalize(&admin, &id);
+                        let finalizer = &members[rng.below(members.len() as u64) as usize];
+                        let _ = c.try_finalize(finalizer, &id);
                     }
                 }
                 _ => {

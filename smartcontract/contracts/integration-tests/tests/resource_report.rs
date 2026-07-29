@@ -5,6 +5,7 @@
 //! `cargo test -p stellar-sentinel-integration-tests --test resource_report -- --nocapture`
 //! to see the report; the asserted bounds are summarized in `RESOURCE-REPORT.md`.
 
+use soroban_sdk::testutils::Address as _;
 mod common;
 
 use common::*;
@@ -15,11 +16,11 @@ const N: u64 = 50;
 #[test]
 fn treasury_storage_growth_is_linear() {
     let env = new_env();
-    let admin = soroban_sdk::testutils::Address::generate(&env);
+    let admin = soroban_sdk::Address::generate(&env);
     let (acl_id, _acl) = deploy_acl(&env, &admin);
     let signers = addrs(&env, 2);
-    let asset = soroban_sdk::testutils::Address::generate(&env);
-    let recipient = soroban_sdk::testutils::Address::generate(&env);
+    let asset = soroban_sdk::Address::generate(&env);
+    let recipient = soroban_sdk::Address::generate(&env);
     let c = deploy_treasury(&env, &admin, &asset, 1, &svec(&env, &signers), &acl_id);
     c.deposit(&signers[0], &(N as i128 * 10_000));
 
@@ -38,11 +39,14 @@ fn treasury_storage_growth_is_linear() {
 #[test]
 fn vault_storage_growth_is_linear() {
     let env = new_env();
-    let admin = soroban_sdk::testutils::Address::generate(&env);
+    let admin = soroban_sdk::Address::generate(&env);
     let (acl_id, _acl) = deploy_acl(&env, &admin);
     let signers = addrs(&env, 2);
-    let c = deploy_vault(&env, &admin, &svec(&env, &signers), 2, &acl_id);
-    let owner = soroban_sdk::testutils::Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let c = deploy_vault(&env, &admin, &asset, &svec(&env, &signers), 2, &acl_id);
+    let owner = soroban_sdk::Address::generate(&env);
+    
+    soroban_sdk::token::StellarAssetClient::new(&env, &asset).mint(&owner, &1_000_000);
 
     for _ in 0..N {
         c.lock_tokens(&owner, &1_000, &100, &symbol_short!("l"));
@@ -59,7 +63,7 @@ fn vault_storage_growth_is_linear() {
 #[test]
 fn governance_storage_growth_is_linear() {
     let env = new_env();
-    let admin = soroban_sdk::testutils::Address::generate(&env);
+    let admin = soroban_sdk::Address::generate(&env);
     let (acl_id, acl) = deploy_acl(&env, &admin);
     let members = addrs(&env, 3);
     for m in &members {
@@ -85,7 +89,7 @@ fn governance_storage_growth_is_linear() {
 #[test]
 fn access_control_storage_growth_is_linear() {
     let env = new_env();
-    let owner = soroban_sdk::testutils::Address::generate(&env);
+    let owner = soroban_sdk::Address::generate(&env);
     let (_, c) = deploy_acl(&env, &owner);
 
     let users = addrs(&env, N as usize);

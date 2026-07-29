@@ -1,5 +1,6 @@
 //! Treasury security invariants (INV-T1 .. INV-T6).
 
+use soroban_sdk::testutils::Address as _;
 mod common;
 
 use common::*;
@@ -13,12 +14,14 @@ fn setup() -> (
     TreasuryContractClient<'static>,
 ) {
     let env = new_env();
-    let admin = soroban_sdk::testutils::Address::generate(&env);
+    let admin = soroban_sdk::Address::generate(&env);
     let (acl_id, _acl) = deploy_acl(&env, &admin);
     let signers = addrs(&env, 3);
-    let asset = soroban_sdk::testutils::Address::generate(&env);
-    let recipient = soroban_sdk::testutils::Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let recipient = soroban_sdk::Address::generate(&env);
     let c = deploy_treasury(&env, &admin, &asset, 2, &svec(&env, &signers), &acl_id);
+    // Mint enough tokens to the treasury for execute() to transfer
+    soroban_sdk::token::StellarAssetClient::new(&env, &asset).mint(&c.address, &10_000_000);
     (env, admin, signers, recipient, c)
 }
 
@@ -122,7 +125,7 @@ fn policy_change_invalidates_stale_proposal() {
     let id = c.propose_withdrawal(&signers[0], &recipient, &4_000, &symbol_short!("rent"), &exp);
 
     // Churn the signer set -> bumps policy version.
-    let new_signer = soroban_sdk::testutils::Address::generate(&env);
+    let new_signer = soroban_sdk::Address::generate(&env);
     c.add_signer(&admin, &new_signer);
 
     // Approval and execution against the stale policy are both rejected.
