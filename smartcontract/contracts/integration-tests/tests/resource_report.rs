@@ -69,7 +69,8 @@ fn governance_storage_growth_is_linear() {
     for m in &members {
         acl.assign_role(&admin, m, &Role::Member);
     }
-    let c = deploy_governance(&env, &admin, &svec(&env, &members), 50, 1_000_000, &acl_id);
+    let treasury_addr = soroban_sdk::Address::generate(&env);
+    let c = deploy_governance(&env, &admin, &svec(&env, &members), 50, 1_000_000, &acl_id, &treasury_addr);
 
     for _ in 0..N {
         c.create_proposal(
