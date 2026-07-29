@@ -136,13 +136,14 @@ pub fn deploy_governance(
 pub fn deploy_vault(
     env: &Env,
     admin: &Address,
+    asset: &Address,
     emergency_signers: &Vec<Address>,
     emergency_threshold: u32,
     acl_id: &Address,
 ) -> TokenVaultContractClient<'static> {
     let id = env.register_contract(None, TokenVaultContract);
     let c = TokenVaultContractClient::new(env, &id);
-    c.initialize(admin, emergency_signers, &emergency_threshold, acl_id);
+    c.initialize(admin, asset, emergency_signers, &emergency_threshold, acl_id);
     c
 }
 
@@ -171,13 +172,15 @@ pub fn assert_treasury_invariants(
 }
 
 /// INV-V1: locked liabilities are non-negative and exactly match tracked assets.
-pub fn assert_vault_locked(c: &TokenVaultContractClient, expected_locked: i128) {
+pub fn assert_vault_locked(env: &Env, c: &TokenVaultContractClient, asset: &Address, expected_locked: i128) {
     let stats = c.get_stats();
     assert!(stats.total_locked >= 0, "INV-V1 total_locked must be non-negative");
     assert_eq!(
         stats.total_locked, expected_locked,
         "INV-V1 total_locked must equal outstanding lock + vesting liabilities"
     );
+    let bal = soroban_sdk::token::Client::new(env, asset).balance(&c.address);
+    assert_eq!(bal, expected_locked, "INV-V1 vault balance must equal total_locked");
 }
 
 /// INV-A1: exactly one Owner exists, and per-role counts equal the number of
