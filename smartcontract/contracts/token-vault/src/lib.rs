@@ -5,6 +5,7 @@ extern crate std;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, symbol_short,
+    token,
     Address, Env, Symbol, Vec,
     log,
 };
@@ -44,6 +45,8 @@ pub enum Error {
     NothingToClaim = 11,
     /// Signer already approved emergency unlock.
     AlreadyApprovedEmergency = 12,
+    /// Vesting schedule has already been revoked.
+    AlreadyRevoked = 13,
 }
 
 // ============================================================================
@@ -56,6 +59,8 @@ pub enum Error {
 pub enum DataKey {
     /// Admin address.
     Admin,
+    /// Token asset address.
+    Asset,
     /// Whether contract is initialized.
     Initialized,
     /// Emergency unlock approvers.
@@ -118,6 +123,8 @@ pub struct VestingSchedule {
     pub cliff: u64,
     /// Description.
     pub memo: Symbol,
+    /// Whether the schedule is revoked.
+    pub revoked: bool,
 }
 
 /// Vault statistics.
@@ -153,6 +160,7 @@ impl TokenVaultContract {
     pub fn initialize(
         env: Env,
         admin: Address,
+        asset: Address,
         emergency_signers: Vec<Address>,
         emergency_threshold: u32,
         acl_address: Address,
@@ -170,6 +178,7 @@ impl TokenVaultContract {
 
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Asset, &asset);
         env.storage()
             .instance()
             .set(&DataKey::EmergencySigners, &emergency_signers);
@@ -224,6 +233,10 @@ impl TokenVaultContract {
         }
 
         owner.require_auth();
+
+        let asset: Address = env.storage().instance().get(&DataKey::Asset).unwrap();
+        let token_client = token::Client::new(&env, &asset);
+        token_client.transfer(&owner, &env.current_contract_address(), &amount);
 
         // Get and increment lock counter
         let lock_id: u64 = env
@@ -316,6 +329,10 @@ impl TokenVaultContract {
         env.storage()
             .instance()
             .set(&DataKey::TotalLocked, &new_total);
+
+        let asset: Address = env.storage().instance().get(&DataKey::Asset).unwrap();
+        let token_client = token::Client::new(&env, &asset);
+        token_client.transfer(&env.current_contract_address(), &owner, &amount);
 
         env.events().publish(
             (symbol_short!("vault"), symbol_short!("claim")),
@@ -455,6 +472,10 @@ impl TokenVaultContract {
             .instance()
             .set(&DataKey::TotalLocked, &new_total);
 
+        let asset: Address = env.storage().instance().get(&DataKey::Asset).unwrap();
+        let token_client = token::Client::new(&env, &asset);
+        token_client.transfer(&env.current_contract_address(), &lock.owner, &amount);
+
         env.events().publish(
             (symbol_short!("vault"), symbol_short!("emrg_ex")),
             (lock_id, caller.clone(), amount),
@@ -490,6 +511,10 @@ impl TokenVaultContract {
 
         admin.require_auth();
 
+        let asset: Address = env.storage().instance().get(&DataKey::Asset).unwrap();
+        let token_client = token::Client::new(&env, &asset);
+        token_client.transfer(&admin, &env.current_contract_address(), &total_amount);
+
         if total_amount <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -517,6 +542,7 @@ impl TokenVaultContract {
             duration,
             cliff,
             memo: memo.clone(),
+            revoked: false,
         };
 
         env.storage()
@@ -558,6 +584,10 @@ impl TokenVaultContract {
             .get(&DataKey::Vesting(vesting_id))
             .ok_or(Error::VestingNotFound)?;
 
+        if schedule.revoked {
+            return Err(Error::AlreadyRevoked);
+        }
+
         if schedule.beneficiary != beneficiary {
             return Err(Error::Unauthorized);
         }
@@ -598,12 +628,70 @@ impl TokenVaultContract {
             .instance()
             .set(&DataKey::TotalLocked, &new_total);
 
+        let asset: Address = env.storage().instance().get(&DataKey::Asset).unwrap();
+        let token_client = token::Client::new(&env, &asset);
+        token_client.transfer(&env.current_contract_address(), &beneficiary, &claimable);
+
         env.events().publish(
             (symbol_short!("vault"), symbol_short!("v_claim")),
             (vesting_id, beneficiary.clone(), claimable),
         );
 
         Ok(claimable)
+    }
+
+    /// Revoke a vesting schedule, returning unclaimed tokens to admin.
+    pub fn revoke_vesting(
+        env: Env,
+        admin: Address,
+        vesting_id: u64,
+    ) -> Result<i128, Error> {
+        Self::require_initialized(&env)?;
+        Self::require_admin(&env, &admin)?;
+
+        admin.require_auth();
+
+        let mut schedule: VestingSchedule = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Vesting(vesting_id))
+            .ok_or(Error::VestingNotFound)?;
+
+        if schedule.revoked {
+            return Err(Error::AlreadyRevoked);
+        }
+
+        let remaining = schedule.total_amount - schedule.claimed_amount;
+        if remaining <= 0 {
+            return Err(Error::NothingToClaim);
+        }
+
+        schedule.revoked = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Vesting(vesting_id), &schedule);
+
+        // Update total locked
+        let total: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalLocked)
+            .unwrap_or(0);
+        let new_total = if total > remaining { total - remaining } else { 0 };
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalLocked, &new_total);
+
+        let asset: Address = env.storage().instance().get(&DataKey::Asset).unwrap();
+        let token_client = token::Client::new(&env, &asset);
+        token_client.transfer(&env.current_contract_address(), &admin, &remaining);
+
+        env.events().publish(
+            (symbol_short!("vault"), symbol_short!("v_revoke")),
+            (vesting_id, admin.clone(), remaining),
+        );
+
+        Ok(remaining)
     }
 
     // ========================================================================
@@ -777,24 +865,26 @@ mod test {
         acl_client.assign_role(admin, target, role);
     }
 
-    fn setup_contract() -> (Env, Address, Address, TokenVaultContractClient<'static>) {
+    fn setup_contract_with_token() -> (Env, Address, Address, TokenVaultContractClient<'static>, Address) {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register_contract(None, TokenVaultContract);
-        let client = TokenVaultContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let acl_id = deploy_acl(&env, &admin);
-        (env, admin, acl_id, client)
+        let asset_contract = env.register_stellar_asset_contract_v2(admin.clone());
+        let asset = asset_contract.address();
+        let contract_id = env.register_contract(None, TokenVaultContract);
+        let client = TokenVaultContractClient::new(&env, &contract_id);
+        (env, admin, acl_id, client, asset)
     }
 
     #[test]
     fn test_initialize() {
-        let (env, admin, acl_id, client) = setup_contract();
+        let (env, admin, acl_id, client, asset) = setup_contract_with_token();
 
         let signer1 = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
 
-        client.initialize(&admin, &signers, &1, &acl_id);
+        client.initialize(&admin, &asset, &signers, &1, &acl_id);
 
         let stats = client.get_stats();
         assert_eq!(stats.admin, admin);
@@ -804,13 +894,17 @@ mod test {
 
     #[test]
     fn test_lock_tokens() {
-        let (env, admin, acl_id, client) = setup_contract();
+        let (env, admin, acl_id, client, asset) = setup_contract_with_token();
 
         let signer1 = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
-        client.initialize(&admin, &signers, &1, &acl_id);
+        client.initialize(&admin, &asset, &signers, &1, &acl_id);
 
         let owner = Address::generate(&env);
+
+        let sac = token::StellarAssetClient::new(&env, &asset);
+        sac.mint(&owner, &1_000_000);
+
         let lock_id = client.lock_tokens(
             &owner,
             &1_000_000,
@@ -830,13 +924,17 @@ mod test {
 
     #[test]
     fn test_create_vesting() {
-        let (env, admin, acl_id, client) = setup_contract();
+        let (env, admin, acl_id, client, asset) = setup_contract_with_token();
 
         let signer1 = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
-        client.initialize(&admin, &signers, &1, &acl_id);
+        client.initialize(&admin, &asset, &signers, &1, &acl_id);
 
         let beneficiary = Address::generate(&env);
+
+        let sac = token::StellarAssetClient::new(&env, &asset);
+        sac.mint(&admin, &10_000_000);
+
         let vesting_id = client.create_vesting(
             &admin,
             &beneficiary,

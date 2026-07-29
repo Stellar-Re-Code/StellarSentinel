@@ -1,6 +1,7 @@
 //! Cross-contract security invariants: authorization consistency, membership
 //! lifecycle, and terminal-operation replay resistance across all four contracts.
 
+use soroban_sdk::testutils::Address as _;
 mod common;
 
 use common::*;
@@ -12,9 +13,9 @@ use soroban_sdk::symbol_short;
 #[test]
 fn role_decisions_gate_privileged_treasury_actions() {
     let env = new_env();
-    let owner = soroban_sdk::testutils::Address::generate(&env);
-    let admin = soroban_sdk::testutils::Address::generate(&env);
-    let member = soroban_sdk::testutils::Address::generate(&env);
+    let owner = soroban_sdk::Address::generate(&env);
+    let admin = soroban_sdk::Address::generate(&env);
+    let member = soroban_sdk::Address::generate(&env);
 
     let (acl_id, acl) = deploy_acl(&env, &owner);
     acl.assign_role(&owner, &admin, &Role::Admin);
@@ -25,9 +26,17 @@ fn role_decisions_gate_privileged_treasury_actions() {
     assert_eq!(acl.is_admin_or_above(&member), false);
     assert_eq!(acl.is_owner(&member), false);
 
+    let members = addrs(&env, 2);
+    for m in &members {
+        acl.assign_role(&owner, m, &Role::Member);
+    }
+
+    let newbie = soroban_sdk::Address::generate(&env);
+    
     let signers = addrs(&env, 2);
-    let asset = soroban_sdk::testutils::Address::generate(&env);
+    let asset = soroban_sdk::Address::generate(&env);
     let treasury = deploy_treasury(&env, &owner, &asset, 1, &svec(&env, &signers), &acl_id);
+    let gov = deploy_governance(&env, &owner, &svec(&env, &members), 34, 50, &acl_id);
     treasury.deposit(&signers[0], &10_000);
 
     assert_eq!(
@@ -48,12 +57,15 @@ fn role_decisions_gate_privileged_treasury_actions() {
 #[test]
 fn governance_membership_lifecycle_updates_authorization() {
     let env = new_env();
-    let admin = soroban_sdk::testutils::Address::generate(&env);
+    let admin = soroban_sdk::Address::generate(&env);
     let (acl_id, _acl) = deploy_acl(&env, &admin);
     let members = addrs(&env, 3);
+    for m in &members {
+        _acl.assign_role(&admin, m, &Role::Member);
+    }
     let gov = deploy_governance(&env, &admin, &svec(&env, &members), 34, 50, &acl_id);
 
-    let newbie = soroban_sdk::testutils::Address::generate(&env);
+    let newbie = soroban_sdk::Address::generate(&env);
     assert_eq!(
         gov.try_create_proposal(
             &newbie,
@@ -76,8 +88,9 @@ fn governance_membership_lifecycle_updates_authorization() {
     );
     gov.vote(&members[0], &add, &true);
     advance_seq(&env, 100);
-    assert_eq!(gov.finalize(&admin, &add), ProposalStatus::Passed);
+    assert_eq!(gov.finalize(&members[0], &add), ProposalStatus::Passed);
     gov.execute_proposal(&admin, &add);
+    _acl.assign_role(&admin, &newbie, &Role::Member);
     assert_eq!(gov.get_config().member_count, 4);
 
     let p = gov.create_proposal(
@@ -100,8 +113,9 @@ fn governance_membership_lifecycle_updates_authorization() {
     );
     gov.vote(&members[0], &rem, &true);
     advance_seq(&env, 100);
-    assert_eq!(gov.finalize(&admin, &rem), ProposalStatus::Passed);
+    assert_eq!(gov.finalize(&members[0], &rem), ProposalStatus::Passed);
     gov.execute_proposal(&admin, &rem);
+    _acl.revoke_role(&admin, &members[1]);
     assert_eq!(gov.get_config().member_count, 3);
 
     assert_eq!(
@@ -123,14 +137,15 @@ fn governance_membership_lifecycle_updates_authorization() {
 fn terminal_operations_cannot_replay_across_contracts() {
     let env = new_env();
 
-    let admin = soroban_sdk::testutils::Address::generate(&env);
+    let admin = soroban_sdk::Address::generate(&env);
     let (acl_id, _acl) = deploy_acl(&env, &admin);
 
     let signers = addrs(&env, 2);
-    let asset = soroban_sdk::testutils::Address::generate(&env);
-    let recipient = soroban_sdk::testutils::Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let recipient = soroban_sdk::Address::generate(&env);
     let treasury = deploy_treasury(&env, &admin, &asset, 2, &svec(&env, &signers), &acl_id);
     treasury.deposit(&signers[0], &10_000);
+    soroban_sdk::token::StellarAssetClient::new(&env, &asset).mint(&treasury.address, &10_000);
     let exp = env.ledger().timestamp() + 10_000;
     let tx = treasury.propose_withdrawal(&signers[0], &recipient, &4_000, &symbol_short!("r"), &exp);
     treasury.approve(&signers[1], &tx);
@@ -141,6 +156,9 @@ fn terminal_operations_cannot_replay_across_contracts() {
     );
 
     let gmembers = addrs(&env, 3);
+    for m in &gmembers {
+        _acl.assign_role(&admin, m, &Role::Member);
+    }
     let gov = deploy_governance(&env, &admin, &svec(&env, &gmembers), 34, 50, &acl_id);
     let pid = gov.create_proposal(
         &gmembers[0],
@@ -152,7 +170,7 @@ fn terminal_operations_cannot_replay_across_contracts() {
     );
     gov.vote(&gmembers[0], &pid, &true);
     advance_seq(&env, 100);
-    gov.finalize(&admin, &pid);
+    gov.finalize(&gmembers[0], &pid);
     gov.execute_proposal(&admin, &pid);
     assert_eq!(
         gov.try_execute_proposal(&admin, &pid),
@@ -160,8 +178,13 @@ fn terminal_operations_cannot_replay_across_contracts() {
     );
 
     let esigners = addrs(&env, 2);
-    let vault = deploy_vault(&env, &admin, &svec(&env, &esigners), 2, &acl_id);
-    let owner = soroban_sdk::testutils::Address::generate(&env);
+    for s in &esigners {
+        _acl.assign_role(&admin, s, &Role::Member);
+    }
+    let asset = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let vault = deploy_vault(&env, &admin, &asset, &svec(&env, &esigners), 2, &acl_id);
+    let owner = soroban_sdk::Address::generate(&env);
+    soroban_sdk::token::StellarAssetClient::new(&env, &asset).mint(&owner, &1_000_000);
     let lock = vault.lock_tokens(&owner, &5_000, &100_000, &symbol_short!("l"));
     vault.approve_emergency(&esigners[0], &lock);
     vault.approve_emergency(&esigners[1], &lock);

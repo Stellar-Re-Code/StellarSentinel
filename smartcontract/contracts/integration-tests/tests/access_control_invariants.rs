@@ -1,5 +1,6 @@
 //! Access-control security invariants (INV-A1 .. INV-A3).
 
+use soroban_sdk::testutils::Address as _;
 mod common;
 
 use common::*;
@@ -16,11 +17,11 @@ fn role_of(rng_val: u64) -> Role {
 #[test]
 fn unauthorized_escalation_rejected() {
     let env = new_env();
-    let owner = soroban_sdk::testutils::Address::generate(&env);
+    let owner = soroban_sdk::Address::generate(&env);
     let (_, c) = deploy_acl(&env, &owner);
 
-    let member = soroban_sdk::testutils::Address::generate(&env);
-    let target = soroban_sdk::testutils::Address::generate(&env);
+    let member = soroban_sdk::Address::generate(&env);
+    let target = soroban_sdk::Address::generate(&env);
     c.assign_role(&owner, &member, &Role::Member);
 
     assert_eq!(c.can_assign(&member, &Role::Admin), false);
@@ -35,7 +36,7 @@ fn unauthorized_escalation_rejected() {
 #[test]
 fn single_owner_through_transfers() {
     let env = new_env();
-    let owner = soroban_sdk::testutils::Address::generate(&env);
+    let owner = soroban_sdk::Address::generate(&env);
     let (_, c) = deploy_acl(&env, &owner);
     let chain = addrs(&env, 4);
 
@@ -56,7 +57,7 @@ fn single_owner_through_transfers() {
 fn seeded_operation_sequences() {
     for seed in [5u64, 55, 555, 9090] {
         let env = new_env();
-        let owner = soroban_sdk::testutils::Address::generate(&env);
+        let owner = soroban_sdk::Address::generate(&env);
         let (_, c) = deploy_acl(&env, &owner);
         let pool = addrs(&env, 5);
         let mut current = owner.clone();
