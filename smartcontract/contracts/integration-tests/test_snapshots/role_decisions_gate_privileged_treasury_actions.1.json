@@ -195,6 +195,9 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAXI7N"
                 }
               ]
             }
@@ -1300,6 +1303,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "TreasuryAddress"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAXI7N"
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "VotingPeriod"
                             }
                           ]
@@ -2255,6 +2270,9 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAXI7N"
                 }
               ]
             }
