@@ -63,8 +63,8 @@ describe('Reconciler', () => {
     const deposit2 = makeTreasuryDepositEvent(SIGNER1, 3_000n, 13_000n, '1002');
     deposit2.id = 'deposit2_001';
     deposit2.txHash = 'tx_deposit2_001';
-    db.insertEvent(parseEvent(deposit2, 'treasury')! ?.event!);
-    handleTreasuryEvent(db, parseEvent(deposit2, 'treasury')! ?.event!);
+    db.insertEvent((parseEvent(deposit2, 'treasury') as any).event);
+    handleTreasuryEvent(db, (parseEvent(deposit2, 'treasury') as any).event);
 
     const reconciler = makeReconciler(db, 6_000n);
     await reconciler.reconcile(db);

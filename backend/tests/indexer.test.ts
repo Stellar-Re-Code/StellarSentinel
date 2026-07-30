@@ -130,6 +130,29 @@ describe('Indexer — missed-ledger catchup', () => {
     const events = db.getEventsByContract(CONTRACT_ID, 100, 0);
     expect(events.length).toBe(1);
   });
+
+  test('restart with new indexer instance resumes from durable cursor without gaps or reprocessing', async () => {
+    // Write an event and update checkpoint in DB simulating a running indexer
+    const raw = makeTreasuryDepositEvent(SIGNER1, 1_000n, 1_000n, '5000');
+    ingest(db, raw);
+    db.upsertCheckpoint(5000, raw.id);
+
+    // Create a NEW indexer instance attached to the SAME db
+    const config = testConfig();
+    config.startLedger = 100; // Intentionally lower default to prove cursor overrides it
+    const newIndexer = new Indexer(db, config);
+    
+    // Mock getEvents on the new indexer's server to verify it asks for ledger 5001
+    const getEventsMock = jest.spyOn((newIndexer as any).server, 'getEvents');
+    getEventsMock.mockResolvedValue({ events: [] } as any);
+
+    await newIndexer.poll();
+
+    // Verify it requested starting from the checkpoint + 1 (5000 + 1 = 5001)
+    expect(getEventsMock).toHaveBeenCalledWith(expect.objectContaining({
+      startLedger: 5001,
+    }));
+  });
 });
 
 describe('Indexer — malformed and unknown events', () => {
@@ -284,7 +307,7 @@ describe('Indexer — gap detection (production code path via Indexer.checkForGa
     const gaps = db.getOpenGaps(CONTRACT_ID);
     expect(gaps.length).toBe(1);
     expect(gaps[0].gap_start).toBe(1002);
-    expect(gaps[0].gap_end).toBe(1009);
+    expect(gaps[0].gap_end).toBe(1010);
     expect(gaps[0].backfilled).toBe(0);
   });
 

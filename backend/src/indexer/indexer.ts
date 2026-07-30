@@ -47,7 +47,13 @@ export class Indexer {
 
   async start(): Promise<void> {
     this.running = true;
-    console.log('[indexer] Starting event ingestion loop');
+    
+    const checkpoint = this.db.getCheckpoint();
+    if (checkpoint) {
+      console.log(`[indexer] Starting event ingestion loop — Resuming from durable cursor: Ledger ${checkpoint.last_ledger}`);
+    } else {
+      console.log(`[indexer] Starting event ingestion loop — No cursor found, starting from config: Ledger ${this.config.startLedger}`);
+    }
 
     while (this.running) {
       try {
@@ -94,7 +100,7 @@ export class Indexer {
       limit: this.config.batchSize,
     });
 
-    const events = eventsResp.events as RawSorobanEvent[];
+    const events = eventsResp.events as unknown as RawSorobanEvent[];
     if (events.length === 0) {
       return 0;
     }

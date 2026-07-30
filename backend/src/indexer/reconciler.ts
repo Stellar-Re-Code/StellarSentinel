@@ -105,10 +105,10 @@ export class Reconciler {
       throw new Error('Contract instance has no storage');
     }
 
-    for (const mapEntry of storage.entries()) {
-      const keyNative = scValToNative(mapEntry.key());
+    for (const mapEntry of (storage as any || [])) {
+      const keyNative = scValToNative(typeof mapEntry.key === 'function' ? mapEntry.key() : mapEntry.key);
       if (keyNative === 'Balance' || (Array.isArray(keyNative) && keyNative[0] === 'Balance')) {
-        const balance = scValToNative(mapEntry.val());
+        const balance = scValToNative(typeof mapEntry.val === 'function' ? mapEntry.val() : mapEntry.val);
         return { balance: String(balance as bigint), ledger };
       }
     }
