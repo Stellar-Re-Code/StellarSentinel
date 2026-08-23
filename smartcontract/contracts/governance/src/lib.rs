@@ -443,6 +443,25 @@ impl GovernanceContract {
             proposal.status = ProposalStatus::Passed;
         } else {
             proposal.status = ProposalStatus::Rejected;
+
+        // A passed Funding proposal's cross-contract authorization is
+        // snapshotted now, at the moment the DAO's decision becomes
+        // final — not later at execution time, which would let a
+        // policy change in between go unnoticed.
+        if proposal.status == ProposalStatus::Passed && proposal.action == ProposalAction::Funding {
+            let treasury_address: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::TreasuryAddress)
+                .ok_or(Error::NotInitialized)?;
+            let cfg = Self::get_treasury_config(&env, &treasury_address)?;
+            proposal.policy_version = cfg.policy_version;
+            proposal.exec_deadline = env
+                .ledger()
+                .timestamp()
+                .checked_add(FUNDING_EXEC_WINDOW)
+                .unwrap_or(u64::MAX);
+        }
         }
 
         let final_status = proposal.status.clone();
@@ -465,21 +484,25 @@ impl GovernanceContract {
     /// # Cross-contract execution (Funding proposals)
     ///
     /// For `ProposalAction::Funding`, the governance contract calls the
-    /// treasury's `propose_withdrawal()` to queue a withdrawal for the
-    /// approved amount and recipient. This follows the *propose-into-treasury*
-    /// trust model: governance does not directly execute the withdrawal;
-    /// instead it creates a treasury transaction that still requires
-    /// signer approvals according to the treasury's m-of-n policy.
+    /// treasury's `execute_governance_withdrawal()` to move the approved
+    /// amount to the target address in a single atomic call — no
+    /// additional treasury signer approval step. The authorization
+    /// payload sent to the treasury is bound to this proposal's ID,
+    /// the treasury's own address, the destination, the treasury's
+    /// bound asset, the amount, and the policy version + execution
+    /// deadline snapshotted when the proposal passed in `finalize`.
     ///
-    /// The governance contract must be registered as a signer in the treasury
-    /// (via `TreasuryContract::add_signer`) for the cross-contract call to
-    /// succeed. If the treasury call fails (e.g. insufficient funds, governance
-    /// not a signer, policy invalidated), the proposal is NOT marked executed
-    /// and the error is propagated to the caller.
-    ///
-    /// This preserves treasury sovereignty — the governance DAO can approve
-    /// spending but cannot unilaterally move funds without going through the
-    /// treasury's own multi-sig approval process.
+    /// The governance contract must be registered as the treasury's
+    /// authorized governance address (via `TreasuryContract::set_governance`)
+    /// for the cross-contract call to succeed — this is a distinct role
+    /// from the multi-sig `Signers` list, so governance never gains
+    /// voting rights over ordinary treasury proposals. If the treasury
+    /// call fails for any reason (insufficient funds, stale policy,
+    /// expired authorization, unauthorized governance) or the execution
+    /// window has elapsed, the proposal is NOT marked executed, no funds
+    /// move, and the error is propagated to the caller — both contracts
+    /// stay consistent and the proposal remains executable once the
+    /// underlying condition is fixed (unless the deadline has passed).
     pub fn execute_proposal(
         env: Env,
         executor: Address,
@@ -524,32 +547,45 @@ impl GovernanceContract {
                 Self::internal_remove_member(&env, &proposal.target)?;
             }
             ProposalAction::Funding => {
+                if env.ledger().timestamp() > proposal.exec_deadline {
+                    return Err(Error::ExecutionExpired);
+                }
+
                 let treasury_address: Address = env
                     .storage()
                     .instance()
                     .get(&DataKey::TreasuryAddress)
                     .ok_or(Error::NotInitialized)?;
 
+                let cfg = Self::get_treasury_config(&env, &treasury_address)?;
+
                 let treasury_client =
                     TreasuryContractClient::new(&env, &treasury_address);
 
-                let expires_at = env
-                    .ledger()
-                    .timestamp()
-                    .checked_add(7 * 24 * 3600)
-                    .unwrap_or(u64::MAX);
+                match treasury_client.try_execute_governance_withdrawal(
+                    &env.current_contract_address(),
+                    &treasury_address,
+                    &proposal_id,
+                    &proposal.target,
+                    &cfg.asset,
+                    &proposal.amount,
+                    &proposal.policy_version,
+                    &proposal.exec_deadline,
+                ) {
+                    Ok(Ok(())) => {}
+                    _ => return Err(Error::FundingExecutionFailed),
+                }
 
-                let memo = symbol_short!("gov_fund");
-
-                let _ = treasury_client
-                    .try_propose_withdrawal(
-                        &env.current_contract_address(),
-                        &proposal.target,
-                        &proposal.amount,
-                        &memo,
-                        &expires_at,
-                    )
-                    .map_err(|_| Error::ProposalRejected)?;
+                env.events().publish(
+                    (symbol_short!("gov"), symbol_short!("fund_wd")),
+                    (
+                        proposal_id,
+                        proposal.target.clone(),
+                        proposal.amount,
+                        proposal.policy_version,
+                        treasury_address.clone(),
+                    ),
+                );
             }
             ProposalAction::PolicyChange | ProposalAction::General => {
                 // PolicyChange and General proposals are handled externally
@@ -568,8 +604,6 @@ impl GovernanceContract {
 
         Ok(())
     }
-
-    // ========================================================================
     // Member Management (Internal)
     // ========================================================================
 
@@ -807,6 +841,16 @@ impl GovernanceContract {
         if *caller != admin {
             return Err(Error::Unauthorized);
         }
+
+    /// Query the treasury's config, collapsing both the invoke-level and
+    /// contract-level error cases into a single `TreasuryUnavailable`.
+    fn get_treasury_config(env: &Env, treasury_address: &Address) -> Result<TreasuryConfig, Error> {
+        let treasury_client = TreasuryContractClient::new(env, treasury_address);
+        match treasury_client.try_get_config() {
+            Ok(Ok(cfg)) => Ok(cfg),
+            _ => Err(Error::TreasuryUnavailable),
+        }
+    }
         Self::require_acl_admin_or_above(env, caller)
     }
 }
