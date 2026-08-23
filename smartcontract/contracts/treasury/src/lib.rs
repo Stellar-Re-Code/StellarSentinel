@@ -591,6 +591,208 @@ impl TreasuryContract {
         Ok(())
     }
 
+
+    // ========================================================================
+    // Governance-Authorized Withdrawal
+    // ========================================================================
+
+    /// Execute an atomic, governance-authorized withdrawal.
+    ///
+    /// This is a separate path from the multi-sig `propose_withdrawal` /
+    /// `approve` / `execute` flow: it lets the registered governance
+    /// contract (see `set_governance`) move funds in a single call once
+    /// its own on-chain vote/quorum process has passed a Funding
+    /// proposal. No additional treasury signer approval step is
+    /// involved, and no off-chain signature can substitute for it —
+    /// `governance` must itself be the caller of this function, which
+    /// Soroban only allows for the actual invoking contract.
+    ///
+    /// The authorization payload is bound to `proposal_id`,
+    /// `treasury_id`, `to`, `asset`, `amount`, `policy_version`, and
+    /// `expires_at`. Every field is re-verified against live treasury
+    /// state immediately before the transfer, and the transfer itself
+    /// always moves this treasury's own bound asset — the caller-
+    /// supplied `asset` is only ever used as a binding check, never to
+    /// select which token moves:
+    /// - `governance` must equal the registered governance address.
+    /// - `treasury_id` must equal this contract's own address.
+    /// - `asset` must equal this treasury's bound asset.
+    /// - `policy_version` must equal the treasury's current policy
+    ///   version — any signer/threshold/governance change since the
+    ///   proposal was authorized invalidates it.
+    /// - `expires_at` must not have passed.
+    /// - `(governance, proposal_id)` must not have been executed
+    ///   before. This is the replay guard; a failed attempt (e.g.
+    ///   insufficient funds) does not consume it, so it can be retried
+    ///   once the underlying condition is fixed.
+    ///
+    /// The token transfer and the execution-state change (balance
+    /// update + replay-guard receipt) happen in the same invocation,
+    /// which Soroban commits atomically — a panic or early `Err`
+    /// return leaves no partial state in either contract.
+    ///
+    /// # Errors
+    /// * `Error::NotInitialized`
+    /// * `Error::GovernanceUnauthorized` - `governance` is not the registered governance contract.
+    /// * `Error::TreasuryMismatch` - `treasury_id` does not match this contract.
+    /// * `Error::InvalidAmount` - `amount` is zero or negative.
+    /// * `Error::AssetMismatch` - `asset` does not match the treasury's bound asset.
+    /// * `Error::AuthorizationExpired` - `expires_at` has passed.
+    /// * `Error::PolicyInvalidated` - `policy_version` is stale.
+    /// * `Error::AuthorizationReplayed` - this proposal was already executed.
+    /// * `Error::InsufficientFunds` - tracked or real token balance is too low.
+    pub fn execute_governance_withdrawal(
+        env: Env,
+        governance: Address,
+        treasury_id: Address,
+        proposal_id: u64,
+        to: Address,
+        asset: Address,
+        amount: i128,
+        policy_version: u32,
+        expires_at: u64,
+    ) -> Result<(), Error> {
+        Self::require_initialized(&env)?;
+
+        governance.require_auth();
+
+        let authorized_governance: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceAddress)
+            .ok_or(Error::GovernanceUnauthorized)?;
+        if governance != authorized_governance {
+            return Err(Error::GovernanceUnauthorized);
+        }
+
+        if treasury_id != env.current_contract_address() {
+            return Err(Error::TreasuryMismatch);
+        }
+
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let bound_asset: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Asset)
+            .ok_or(Error::NotInitialized)?;
+        if asset != bound_asset {
+            return Err(Error::AssetMismatch);
+        }
+
+        if env.ledger().timestamp() > expires_at {
+            return Err(Error::AuthorizationExpired);
+        }
+
+        let current_policy_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PolicyVersion)
+            .unwrap_or(1);
+        if policy_version != current_policy_version {
+            return Err(Error::PolicyInvalidated);
+        }
+
+        let replay_key = DataKey::GovExecuted(governance.clone(), proposal_id);
+        if env.storage().persistent().has(&replay_key) {
+            return Err(Error::AuthorizationReplayed);
+        }
+
+        let current_balance: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Balance)
+            .unwrap_or(0);
+        if current_balance < amount {
+            return Err(Error::InsufficientFunds);
+        }
+
+        // Perform the real asset transfer before state mutation — atomic
+        // with the whole invocation, same reasoning as `execute()`.
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &bound_asset);
+
+        let contract_token_balance = token_client.balance(&contract_address);
+        if contract_token_balance < amount {
+            return Err(Error::InsufficientFunds);
+        }
+
+        token_client.transfer(&contract_address, &to, &amount);
+
+        // Mark executed and deduct tracked balance — durable and terminal.
+        let new_balance = current_balance - amount;
+        env.storage().instance().set(&DataKey::Balance, &new_balance);
+
+        let receipt = GovernanceWithdrawalReceipt {
+            proposal_id,
+            governance: governance.clone(),
+            to: to.clone(),
+            amount,
+            policy_version,
+            ledger: env.ledger().sequence(),
+        };
+        env.storage().persistent().set(&replay_key, &receipt);
+
+        // Emit an event carrying every bound field so an indexer can
+        // reconstruct the proposal-to-withdrawal link independently of
+        // the governance contract's own event stream.
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("gov_wd")),
+            (proposal_id, governance.clone(), to.clone(), amount, policy_version, new_balance),
+        );
+
+        log!(&env, "Governance withdrawal for proposal #{}: {} to {:?}", proposal_id, amount, to);
+        Ok(())
+    }
+
+    /// Register the governance contract authorized to trigger direct,
+    /// atomic withdrawals via `execute_governance_withdrawal`. Only the
+    /// admin can set this.
+    ///
+    /// Changing the authorized governance address is a policy change:
+    /// it bumps the policy version, which invalidates any pending
+    /// multi-sig `Transaction` or governance authorization snapshotted
+    /// under the old policy.
+    pub fn set_governance(env: Env, admin: Address, governance: Address) -> Result<(), Error> {
+        Self::require_initialized(&env)?;
+        Self::require_admin(&env, &admin)?;
+
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernanceAddress, &governance);
+
+        let mut policy_version: u32 = env.storage().instance().get(&DataKey::PolicyVersion).unwrap_or(1);
+        policy_version += 1;
+        env.storage().instance().set(&DataKey::PolicyVersion, &policy_version);
+
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("gov_set")),
+            (governance, policy_version),
+        );
+
+        Ok(())
+    }
+
+    /// Get the registered governance contract, if any.
+    pub fn get_governance(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::GovernanceAddress)
+    }
+
+    /// Get the audit receipt for a governance-authorized withdrawal, if executed.
+    pub fn get_governance_withdrawal(
+        env: Env,
+        governance: Address,
+        proposal_id: u64,
+    ) -> Option<GovernanceWithdrawalReceipt> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GovExecuted(governance, proposal_id))
+    }
+
     /// Revoke a previous approval for a transaction.
     /// Can only be done before execution.
     pub fn revoke_approval(env: Env, signer: Address, tx_id: u64) -> Result<u32, Error> {
