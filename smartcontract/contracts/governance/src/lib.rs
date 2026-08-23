@@ -9,8 +9,8 @@ use soroban_sdk::{
     log,
 };
 
+use stellar_sentinel_access_control::AccessControlContractClient;
 use stellar_sentinel_treasury::{TreasuryConfig, TreasuryContractClient};
-use stellar_sentinel_treasury::TreasuryContractClient;
 
 // ============================================================================
 // Error Codes
@@ -45,12 +45,12 @@ pub enum Error {
     NotAMember = 11,
     /// Voting period is still active.
     VotingStillActive = 12,
+    /// The treasury contract could not be reached or is not initialized.
     TreasuryUnavailable = 13,
     /// The execution window for a passed Funding proposal has elapsed.
     ExecutionExpired = 14,
     /// The cross-contract call to execute the treasury withdrawal failed.
     FundingExecutionFailed = 15,
-}
 }
 
 // ============================================================================
@@ -145,6 +145,8 @@ pub struct Proposal {
     pub amount: i128,
     /// Optional: target address (for member add/remove).
     pub target: Address,
+    /// Treasury policy version snapshotted when this proposal passed
+    /// (Funding proposals only; 0 for other action types). Bound into
     /// the cross-contract authorization payload so a treasury policy
     /// change after passage invalidates execution.
     pub policy_version: u32,
@@ -152,8 +154,6 @@ pub struct Proposal {
     /// must be executed (Funding proposals only; 0 for other action
     /// types). Bound into the cross-contract authorization payload.
     pub exec_deadline: u64,
-}
-
 }
 
 /// Governance configuration.
@@ -171,8 +171,6 @@ pub struct GovConfig {
 /// after its authorization is snapshotted at `finalize`. Bound into
 /// the cross-contract authorization payload as `exec_deadline`.
 const FUNDING_EXEC_WINDOW: u64 = 7 * 24 * 3600;
-
-// ============================================================================
 
 // ============================================================================
 // Contract Implementation
@@ -300,7 +298,6 @@ impl GovernanceContract {
             created_at: current_ledger,
             ends_at,
             amount,
-            target: target.clone(),
             target: target.clone(),
             policy_version: 0,
             exec_deadline: 0,
@@ -443,6 +440,7 @@ impl GovernanceContract {
             proposal.status = ProposalStatus::Passed;
         } else {
             proposal.status = ProposalStatus::Rejected;
+        }
 
         // A passed Funding proposal's cross-contract authorization is
         // snapshotted now, at the moment the DAO's decision becomes
@@ -461,7 +459,6 @@ impl GovernanceContract {
                 .timestamp()
                 .checked_add(FUNDING_EXEC_WINDOW)
                 .unwrap_or(u64::MAX);
-        }
         }
 
         let final_status = proposal.status.clone();
@@ -604,6 +601,8 @@ impl GovernanceContract {
 
         Ok(())
     }
+
+    // ========================================================================
     // Member Management (Internal)
     // ========================================================================
 
@@ -841,6 +840,8 @@ impl GovernanceContract {
         if *caller != admin {
             return Err(Error::Unauthorized);
         }
+        Self::require_acl_admin_or_above(env, caller)
+    }
 
     /// Query the treasury's config, collapsing both the invoke-level and
     /// contract-level error cases into a single `TreasuryUnavailable`.
@@ -850,8 +851,6 @@ impl GovernanceContract {
             Ok(Ok(cfg)) => Ok(cfg),
             _ => Err(Error::TreasuryUnavailable),
         }
-    }
-        Self::require_acl_admin_or_above(env, caller)
     }
 }
 
@@ -863,6 +862,8 @@ impl GovernanceContract {
 mod test {
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Ledger as _;
+    use soroban_sdk::token;
     use soroban_sdk::Env;
     use stellar_sentinel_access_control::{
         AccessControlContract, AccessControlContractClient, Role,
@@ -972,5 +973,189 @@ mod test {
         client.vote(&member1, &proposal_id, &true);
 
         assert_eq!(client.has_voted(&proposal_id, &member1), true);
+    }
+
+    // ========================================================================
+    // Funding proposal → atomic treasury withdrawal
+    // ========================================================================
+
+    fn setup_funding_flow(
+        env: &Env,
+    ) -> (
+        Address,
+        Address,
+        stellar_sentinel_treasury::TreasuryContractClient<'static>,
+        GovernanceContractClient<'static>,
+        Address,
+    ) {
+        let admin = Address::generate(env);
+        let acl_id = deploy_acl(env, &admin);
+
+        let treasury_signer = Address::generate(env);
+        assign_role(env, &acl_id, &admin, &treasury_signer, &Role::Member);
+        let asset_contract = env.register_stellar_asset_contract_v2(admin.clone());
+        let asset = asset_contract.address();
+        let treasury_id = env.register_contract(None, stellar_sentinel_treasury::TreasuryContract);
+        let treasury = stellar_sentinel_treasury::TreasuryContractClient::new(env, &treasury_id);
+        let signers = Vec::from_array(env, [treasury_signer.clone()]);
+        treasury.initialize(&admin, &asset, &1, &signers, &acl_id);
+
+        let gov_member = Address::generate(env);
+        assign_role(env, &acl_id, &admin, &gov_member, &Role::Member);
+        let members = Vec::from_array(env, [gov_member.clone()]);
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let gov = GovernanceContractClient::new(env, &gov_id);
+        gov.initialize(&admin, &members, &50, &1000, &acl_id, &treasury_id);
+
+        treasury.set_governance(&admin, &gov_id);
+
+        let sac = token::StellarAssetClient::new(env, &asset);
+        sac.mint(&treasury_id, &1_000_000);
+        sac.mint(&treasury_signer, &1_000_000);
+        treasury.deposit(&treasury_signer, &1_000_000);
+
+        (admin, gov_member, treasury, gov, asset)
+    }
+
+    #[test]
+    fn test_funding_proposal_executes_atomic_treasury_withdrawal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, gov_member, treasury, gov, asset) = setup_funding_flow(&env);
+        let recipient = Address::generate(&env);
+
+        let pid = gov.create_proposal(
+            &gov_member,
+            &symbol_short!("fund_ops"),
+            &symbol_short!("ops"),
+            &ProposalAction::Funding,
+            &250_000,
+            &recipient,
+        );
+        gov.vote(&gov_member, &pid, &true);
+        env.ledger().with_mut(|l| l.sequence_number += 2000);
+        assert_eq!(gov.finalize(&gov_member, &pid), ProposalStatus::Passed);
+
+        let token_client = token::Client::new(&env, &asset);
+        let recipient_before = token_client.balance(&recipient);
+
+        gov.execute_proposal(&admin, &pid);
+
+        let proposal = gov.get_proposal(&pid);
+        assert_eq!(proposal.status, ProposalStatus::Executed);
+        assert_eq!(token_client.balance(&recipient), recipient_before + 250_000);
+        assert_eq!(treasury.get_balance(), 750_000);
+
+        // Exactly once: a second execute_proposal call cannot re-run it,
+        // and even a raw replay of the same authorization against the
+        // treasury directly is rejected independently (defense in depth).
+        assert_eq!(
+            gov.try_execute_proposal(&admin, &pid),
+            Err(Ok(Error::ProposalRejected))
+        );
+        assert_eq!(
+            treasury.try_execute_governance_withdrawal(
+                &gov.address, &treasury.address, &pid, &recipient, &asset,
+                &250_000, &proposal.policy_version, &proposal.exec_deadline,
+            ),
+            Err(Ok(stellar_sentinel_treasury::Error::AuthorizationReplayed))
+        );
+    }
+
+    #[test]
+    fn test_funding_proposal_stale_policy_after_signer_change_fails_atomically() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, gov_member, treasury, gov, _asset) = setup_funding_flow(&env);
+        let recipient = Address::generate(&env);
+
+        let pid = gov.create_proposal(
+            &gov_member,
+            &symbol_short!("fund_ops"),
+            &symbol_short!("ops"),
+            &ProposalAction::Funding,
+            &250_000,
+            &recipient,
+        );
+        gov.vote(&gov_member, &pid, &true);
+        env.ledger().with_mut(|l| l.sequence_number += 2000);
+        assert_eq!(gov.finalize(&gov_member, &pid), ProposalStatus::Passed);
+
+        // Treasury policy changes after the proposal passed — its
+        // snapshotted policy_version is now stale.
+        let new_signer = Address::generate(&env);
+        treasury.add_signer(&admin, &new_signer);
+
+        assert_eq!(
+            gov.try_execute_proposal(&admin, &pid),
+            Err(Ok(Error::FundingExecutionFailed))
+        );
+
+        // Consistent on both sides: proposal stays Passed, treasury balance untouched.
+        let proposal = gov.get_proposal(&pid);
+        assert_eq!(proposal.status, ProposalStatus::Passed);
+        assert_eq!(treasury.get_balance(), 1_000_000);
+    }
+
+    #[test]
+    fn test_funding_proposal_fails_when_governance_not_registered() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, gov_member, treasury, gov, _asset) = setup_funding_flow(&env);
+
+        // Re-point authorization at a different (unrelated) governance
+        // contract, simulating "governance never registered" for `gov`.
+        let other_gov = Address::generate(&env);
+        treasury.set_governance(&admin, &other_gov);
+
+        let recipient = Address::generate(&env);
+        let pid = gov.create_proposal(
+            &gov_member,
+            &symbol_short!("fund_ops"),
+            &symbol_short!("ops"),
+            &ProposalAction::Funding,
+            &250_000,
+            &recipient,
+        );
+        gov.vote(&gov_member, &pid, &true);
+        env.ledger().with_mut(|l| l.sequence_number += 2000);
+        assert_eq!(gov.finalize(&gov_member, &pid), ProposalStatus::Passed);
+
+        assert_eq!(
+            gov.try_execute_proposal(&admin, &pid),
+            Err(Ok(Error::FundingExecutionFailed))
+        );
+        let proposal = gov.get_proposal(&pid);
+        assert_eq!(proposal.status, ProposalStatus::Passed);
+        assert_eq!(treasury.get_balance(), 1_000_000);
+    }
+
+    #[test]
+    fn test_funding_proposal_execution_deadline_enforced() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, gov_member, treasury, gov, _asset) = setup_funding_flow(&env);
+        let recipient = Address::generate(&env);
+
+        let pid = gov.create_proposal(
+            &gov_member,
+            &symbol_short!("fund_ops"),
+            &symbol_short!("ops"),
+            &ProposalAction::Funding,
+            &250_000,
+            &recipient,
+        );
+        gov.vote(&gov_member, &pid, &true);
+        env.ledger().with_mut(|l| l.sequence_number += 2000);
+        assert_eq!(gov.finalize(&gov_member, &pid), ProposalStatus::Passed);
+
+        let proposal = gov.get_proposal(&pid);
+        env.ledger().set_timestamp(proposal.exec_deadline + 1);
+
+        assert_eq!(
+            gov.try_execute_proposal(&admin, &pid),
+            Err(Ok(Error::ExecutionExpired))
+        );
+        assert_eq!(treasury.get_balance(), 1_000_000);
     }
 }
