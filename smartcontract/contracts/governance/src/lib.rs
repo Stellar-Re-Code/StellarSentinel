@@ -9,7 +9,7 @@ use soroban_sdk::{
     log,
 };
 
-use stellar_sentinel_access_control::AccessControlContractClient;
+use stellar_sentinel_treasury::{TreasuryConfig, TreasuryContractClient};
 use stellar_sentinel_treasury::TreasuryContractClient;
 
 // ============================================================================
@@ -45,6 +45,12 @@ pub enum Error {
     NotAMember = 11,
     /// Voting period is still active.
     VotingStillActive = 12,
+    TreasuryUnavailable = 13,
+    /// The execution window for a passed Funding proposal has elapsed.
+    ExecutionExpired = 14,
+    /// The cross-contract call to execute the treasury withdrawal failed.
+    FundingExecutionFailed = 15,
+}
 }
 
 // ============================================================================
@@ -139,6 +145,15 @@ pub struct Proposal {
     pub amount: i128,
     /// Optional: target address (for member add/remove).
     pub target: Address,
+    /// the cross-contract authorization payload so a treasury policy
+    /// change after passage invalidates execution.
+    pub policy_version: u32,
+    /// Ledger timestamp deadline by which a passed Funding proposal
+    /// must be executed (Funding proposals only; 0 for other action
+    /// types). Bound into the cross-contract authorization payload.
+    pub exec_deadline: u64,
+}
+
 }
 
 /// Governance configuration.
@@ -151,6 +166,13 @@ pub struct GovConfig {
     pub voting_period: u32,
     pub proposal_count: u64,
 }
+
+/// Window, in seconds, a passed Funding proposal has to be executed
+/// after its authorization is snapshotted at `finalize`. Bound into
+/// the cross-contract authorization payload as `exec_deadline`.
+const FUNDING_EXEC_WINDOW: u64 = 7 * 24 * 3600;
+
+// ============================================================================
 
 // ============================================================================
 // Contract Implementation
@@ -279,6 +301,9 @@ impl GovernanceContract {
             ends_at,
             amount,
             target: target.clone(),
+            target: target.clone(),
+            policy_version: 0,
+            exec_deadline: 0,
         };
 
         env.storage()
