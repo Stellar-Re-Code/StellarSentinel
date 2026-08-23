@@ -59,6 +59,16 @@ pub enum Error {
     PolicyInvalidated = 18,
     /// Duplicate signer in initialization or addition.
     DuplicateSigner = 19,
+    /// Caller is not the registered governance contract for this treasury.
+    GovernanceUnauthorized = 20,
+    /// The asset in the authorization payload does not match this treasury's bound asset.
+    AssetMismatch = 21,
+    /// The treasury ID in the authorization payload does not match this contract.
+    TreasuryMismatch = 22,
+    /// The governance-issued authorization has expired.
+    AuthorizationExpired = 23,
+    /// This (governance, proposal) authorization has already been executed.
+    AuthorizationReplayed = 24,
 }
 
 // ============================================================================
@@ -89,6 +99,14 @@ pub enum DataKey {
     PolicyVersion,
     /// The access-control contract address for RBAC enforcement.
     AclAddress,
+    /// The governance contract authorized to trigger direct, atomic
+    /// withdrawals via `execute_governance_withdrawal`. Distinct from
+    /// `Signers` — holding this role does not grant multi-sig voting
+    /// rights over ordinary treasury proposals.
+    GovernanceAddress,
+    /// Replay guard + audit receipt for a governance-authorized
+    /// withdrawal, keyed by (governance contract, proposal id).
+    GovExecuted(Address, u64),
 }
 
 /// A pending transaction proposal in the multi-sig treasury.
@@ -117,6 +135,27 @@ pub struct Transaction {
     pub canceled: bool,
     /// The policy version under which this transaction is valid.
     pub policy_version: u32,
+}
+
+/// Audit receipt for a governance-authorized withdrawal. Stored per
+/// (governance, proposal_id) once executed so an indexer or a later
+/// on-chain query can reconstruct the proposal-to-withdrawal link
+/// without relying solely on the event stream.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernanceWithdrawalReceipt {
+    /// The governance proposal ID this withdrawal was authorized under.
+    pub proposal_id: u64,
+    /// The governance contract that authorized the withdrawal.
+    pub governance: Address,
+    /// The destination address.
+    pub to: Address,
+    /// The amount transferred.
+    pub amount: i128,
+    /// The treasury policy version the authorization was validated against.
+    pub policy_version: u32,
+    /// The ledger sequence at which the withdrawal executed.
+    pub ledger: u32,
 }
 
 /// Treasury configuration data.
