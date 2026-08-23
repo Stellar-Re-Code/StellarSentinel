@@ -202,17 +202,16 @@ fn terminal_operations_cannot_replay_across_contracts() {
 }
 
 /// INV-X4: A passed Funding proposal in governance drives a cross-contract
-/// call to the treasury, creating a withdrawal transaction. The proposal is
-/// only marked executed after the treasury accepts the request. Governance
-/// must be registered as a treasury signer for the call to succeed.
+/// call to the treasury's `execute_governance_withdrawal`, which transfers
+/// the real asset to the recipient in the same atomic invocation and marks
+/// the proposal executed. Governance must be registered as the treasury's
+/// authorized governance contract (a role distinct from the multi-sig
+/// `Signers` list) for the call to succeed.
 #[test]
-fn funding_proposal_execution_queues_treasury_withdrawal() {
+fn funding_proposal_execution_transfers_atomically() {
     let env = new_env();
     let admin = soroban_sdk::Address::generate(&env);
     let (acl_id, _acl) = deploy_acl(&env, &admin);
-
-    let gov_member = soroban_sdk::Address::generate(&env);
-    _acl.assign_role(&admin, &gov_member, &Role::Member);
 
     let treasury_signers = addrs(&env, 2);
     for s in &treasury_signers {
@@ -226,7 +225,6 @@ fn funding_proposal_execution_queues_treasury_withdrawal() {
         &acl_id,
     );
 
-    // Add governance as a treasury signer so it can propose withdrawals
     let gov_members = addrs(&env, 1);
     for m in &gov_members {
         _acl.assign_role(&admin, m, &Role::Member);
@@ -235,11 +233,13 @@ fn funding_proposal_execution_queues_treasury_withdrawal() {
         &env, &admin, &svec(&env, &gov_members), 34, 50,
         &acl_id, &treasury.address,
     );
-    treasury.add_signer(&admin, &gov.address);
+    // Register governance as the treasury's authorized cross-contract
+    // caller — distinct from adding it to the multi-sig signer list.
+    treasury.set_governance(&admin, &gov.address);
 
-    // Fund the treasury
+    // Fund the treasury with real tokens
     let sac_client = soroban_sdk::token::StellarAssetClient::new(&env, &asset);
-    sac_client.mint(&treasury.address, &100_000);
+    sac_client.mint(&treasury_signers[0], &100_000);
     treasury.deposit(&treasury_signers[0], &100_000);
 
     // Create and pass a Funding proposal
@@ -256,36 +256,32 @@ fn funding_proposal_execution_queues_treasury_withdrawal() {
     advance_seq(&env, 100);
     assert_eq!(gov.finalize(&gov_members[0], &pid), ProposalStatus::Passed);
 
-    // Execute — should create a treasury withdrawal transaction
+    let token_client = soroban_sdk::token::Client::new(&env, &asset);
+    let recipient_before = token_client.balance(&recipient);
+
+    // Execute — should transfer real tokens to the recipient in one shot
     gov.execute_proposal(&admin, &pid);
     let proposal = gov.get_proposal(&pid);
     assert_eq!(proposal.status, ProposalStatus::Executed);
 
-    // Verify treasury transaction was created
-    let tx = treasury.get_transaction(&1);
-    assert_eq!(tx.amount, 40_000);
-    assert_eq!(tx.to, recipient);
-    assert_eq!(tx.proposer, gov.address);
-    assert_eq!(tx.approvals.len(), 1);
-    assert_eq!(tx.approvals.get(0).unwrap(), gov.address);
-    assert_eq!(tx.executed, false);
-    assert_eq!(tx.canceled, false);
+    assert_eq!(token_client.balance(&recipient), recipient_before + 40_000);
+    let receipt = treasury.get_governance_withdrawal(&gov.address, &pid).unwrap();
+    assert_eq!(receipt.amount, 40_000);
+    assert_eq!(receipt.to, recipient);
+    assert_eq!(receipt.policy_version, proposal.policy_version);
 
-    assert_treasury_invariants(&treasury, 100_000, 0);
+    assert_treasury_invariants(&treasury, 100_000, 40_000);
     assert_acl_consistent(&_acl);
 }
 
-/// INV-X4 deny path: governance not registered as a treasury signer
-/// cannot propose withdrawals — the Funding proposal stays un-executed
-/// and the treasury is never touched.
+/// INV-X4 deny path: governance not registered as the treasury's
+/// authorized governance contract cannot execute withdrawals — the
+/// Funding proposal stays un-executed and no tokens move.
 #[test]
-fn funding_proposal_fails_when_governance_not_a_signer() {
+fn funding_proposal_fails_when_governance_not_authorized() {
     let env = new_env();
     let admin = soroban_sdk::Address::generate(&env);
     let (acl_id, _acl) = deploy_acl(&env, &admin);
-
-    let gov_member = soroban_sdk::Address::generate(&env);
-    _acl.assign_role(&admin, &gov_member, &Role::Member);
 
     let treasury_signers = addrs(&env, 2);
     for s in &treasury_signers {
@@ -299,7 +295,7 @@ fn funding_proposal_fails_when_governance_not_a_signer() {
         &acl_id,
     );
 
-    // NOTE: governance is NOT added as a treasury signer
+    // NOTE: governance is NOT registered via set_governance
     let gov_members = addrs(&env, 1);
     for m in &gov_members {
         _acl.assign_role(&admin, m, &Role::Member);
@@ -310,7 +306,7 @@ fn funding_proposal_fails_when_governance_not_a_signer() {
     );
 
     let sac_client = soroban_sdk::token::StellarAssetClient::new(&env, &asset);
-    sac_client.mint(&treasury.address, &100_000);
+    sac_client.mint(&treasury_signers[0], &100_000);
     treasury.deposit(&treasury_signers[0], &100_000);
 
     let recipient = soroban_sdk::Address::generate(&env);
@@ -326,35 +322,32 @@ fn funding_proposal_fails_when_governance_not_a_signer() {
     advance_seq(&env, 100);
     assert_eq!(gov.finalize(&gov_members[0], &pid), ProposalStatus::Passed);
 
-    // Execute should fail — governance is not a treasury signer
+    let token_client = soroban_sdk::token::Client::new(&env, &asset);
+    let recipient_before = token_client.balance(&recipient);
+
+    // Execute should fail — governance is not the authorized caller
     assert_eq!(
         gov.try_execute_proposal(&admin, &pid),
-        Err(Ok(governance::Error::ProposalRejected))
+        Err(Ok(governance::Error::FundingExecutionFailed))
     );
 
-    // Proposal must NOT be marked executed
+    // Proposal must NOT be marked executed, and no tokens moved
     let proposal = gov.get_proposal(&pid);
     assert_eq!(proposal.status, ProposalStatus::Passed);
+    assert_eq!(token_client.balance(&recipient), recipient_before);
 
-    // No treasury transaction should exist
-    assert_eq!(
-        treasury.try_get_transaction(&1),
-        Err(Ok(treasury::Error::TransactionNotFound))
-    );
-
+    assert_treasury_invariants(&treasury, 100_000, 0);
     assert_acl_consistent(&_acl);
 }
 
 /// INV-X4 failure-atomicity: insufficient funds in the treasury must
-/// not mark the governance proposal executed.
+/// not mark the governance proposal executed, and must not move any
+/// tokens — verified with the real token client.
 #[test]
 fn funding_proposal_insufficient_treasury_balance_does_not_execute() {
     let env = new_env();
     let admin = soroban_sdk::Address::generate(&env);
     let (acl_id, _acl) = deploy_acl(&env, &admin);
-
-    let gov_member = soroban_sdk::Address::generate(&env);
-    _acl.assign_role(&admin, &gov_member, &Role::Member);
 
     let treasury_signers = addrs(&env, 2);
     for s in &treasury_signers {
@@ -376,11 +369,11 @@ fn funding_proposal_insufficient_treasury_balance_does_not_execute() {
         &env, &admin, &svec(&env, &gov_members), 34, 50,
         &acl_id, &treasury.address,
     );
-    treasury.add_signer(&admin, &gov.address);
+    treasury.set_governance(&admin, &gov.address);
 
     // Treasury has only 1_000, but proposal asks for 40_000
     let sac_client = soroban_sdk::token::StellarAssetClient::new(&env, &asset);
-    sac_client.mint(&treasury.address, &1_000);
+    sac_client.mint(&treasury_signers[0], &1_000);
     treasury.deposit(&treasury_signers[0], &1_000);
 
     let recipient = soroban_sdk::Address::generate(&env);
@@ -396,16 +389,109 @@ fn funding_proposal_insufficient_treasury_balance_does_not_execute() {
     advance_seq(&env, 100);
     assert_eq!(gov.finalize(&gov_members[0], &pid), ProposalStatus::Passed);
 
+    let token_client = soroban_sdk::token::Client::new(&env, &asset);
+    let recipient_before = token_client.balance(&recipient);
+
     // Execute should fail — insufficient treasury balance
     assert_eq!(
         gov.try_execute_proposal(&admin, &pid),
-        Err(Ok(governance::Error::ProposalRejected))
+        Err(Ok(governance::Error::FundingExecutionFailed))
     );
 
     // Proposal MUST NOT be marked executed — failure atomicity
     let proposal = gov.get_proposal(&pid);
     assert_eq!(proposal.status, ProposalStatus::Passed);
+    assert_eq!(token_client.balance(&recipient), recipient_before);
+    assert!(treasury.get_governance_withdrawal(&gov.address, &pid).is_none());
 
-    assert_treasury_invariants(&treasury, 1_000, 0);
+    // The condition can be fixed and the same proposal retried later.
+    sac_client.mint(&treasury_signers[0], &40_000);
+    treasury.deposit(&treasury_signers[0], &40_000);
+    gov.execute_proposal(&admin, &pid);
+    assert_eq!(gov.get_proposal(&pid).status, ProposalStatus::Executed);
+    assert_eq!(token_client.balance(&recipient), recipient_before + 40_000);
+
+    assert_treasury_invariants(&treasury, 41_000, 40_000);
+    assert_acl_consistent(&_acl);
+}
+
+/// INV-X4 security: a governance-authorized withdrawal cannot be replayed
+/// against the treasury directly (same proposal_id resubmitted), and a
+/// payload minted for one treasury cannot be redirected at another —
+/// covering the explicit replay / cross-contract misuse requirement with
+/// the real token client.
+#[test]
+fn funding_proposal_replay_and_cross_contract_misuse_is_rejected() {
+    let env = new_env();
+    let admin = soroban_sdk::Address::generate(&env);
+    let (acl_id, _acl) = deploy_acl(&env, &admin);
+
+    let treasury_signers = addrs(&env, 1);
+    _acl.assign_role(&admin, &treasury_signers[0], &Role::Member);
+
+    let asset = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let treasury_a = deploy_treasury(&env, &admin, &asset, 1, &svec(&env, &treasury_signers), &acl_id);
+    let treasury_b = deploy_treasury(&env, &admin, &asset, 1, &svec(&env, &treasury_signers), &acl_id);
+
+    let gov_members = addrs(&env, 1);
+    _acl.assign_role(&admin, &gov_members[0], &Role::Member);
+    let gov = deploy_governance(&env, &admin, &svec(&env, &gov_members), 34, 50, &acl_id, &treasury_a.address);
+    treasury_a.set_governance(&admin, &gov.address);
+    treasury_b.set_governance(&admin, &gov.address);
+
+    let sac_client = soroban_sdk::token::StellarAssetClient::new(&env, &asset);
+    sac_client.mint(&treasury_signers[0], &200_000);
+    treasury_a.deposit(&treasury_signers[0], &100_000);
+    sac_client.mint(&treasury_signers[0], &100_000);
+    treasury_b.deposit(&treasury_signers[0], &100_000);
+
+    let recipient = soroban_sdk::Address::generate(&env);
+    let pid = gov.create_proposal(
+        &gov_members[0], &symbol_short!("fund"), &symbol_short!("ops"),
+        &ProposalAction::Funding, &40_000, &recipient,
+    );
+    gov.vote(&gov_members[0], &pid, &true);
+    advance_seq(&env, 100);
+    assert_eq!(gov.finalize(&gov_members[0], &pid), ProposalStatus::Passed);
+
+    gov.execute_proposal(&admin, &pid);
+    let proposal = gov.get_proposal(&pid);
+    assert_eq!(proposal.status, ProposalStatus::Executed);
+
+    // Replay: the exact same authorization resubmitted directly to the
+    // treasury it was executed against must be rejected.
+    assert_eq!(
+        treasury_a.try_execute_governance_withdrawal(
+            &gov.address, &treasury_a.address, &pid, &recipient, &asset,
+            &40_000, &proposal.policy_version, &proposal.exec_deadline,
+        ),
+        Err(Ok(treasury::Error::AuthorizationReplayed))
+    );
+
+    // Cross-contract misuse: the same governance/proposal authorization
+    // cannot be redirected at a different treasury instance by lying
+    // about which treasury_id it's for.
+    assert_eq!(
+        treasury_b.try_execute_governance_withdrawal(
+            &gov.address, &treasury_a.address, &pid, &recipient, &asset,
+            &40_000, &proposal.policy_version, &proposal.exec_deadline,
+        ),
+        Err(Ok(treasury::Error::TreasuryMismatch))
+    );
+
+    // Even with a correctly-labeled treasury_id, treasury_b never
+    // authorized this proposal_id under its own storage, so a fresh
+    // attempt using treasury_b's real identity still succeeds
+    // independently (it's a distinct, legitimate authorization) —
+    // proving the replay guard is scoped per treasury, not a global
+    // bypass, while still requiring its own policy_version.
+    let cfg_b = treasury_b.get_config();
+    treasury_b.execute_governance_withdrawal(
+        &gov.address, &treasury_b.address, &pid, &recipient, &asset,
+        &40_000, &cfg_b.policy_version, &proposal.exec_deadline,
+    );
+
+    assert_treasury_invariants(&treasury_a, 100_000, 40_000);
+    assert_treasury_invariants(&treasury_b, 100_000, 40_000);
     assert_acl_consistent(&_acl);
 }
