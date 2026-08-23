@@ -45,4 +45,7 @@ jobs:
         run: cargo test --all
 
       - name: Build WASM artifacts
-        run: cargo build --release --target wasm32-unknown-unknown -p stellar-sentinel-treasury -p stellar-sentinel-governance -p stellar-sentinel-token-vault -p stellar-sentinel-access-control
+        run: |
+          for crate in stellar-sentinel-access-control stellar-sentinel-treasury stellar-sentinel-governance stellar-sentinel-token-vault; do
+            cargo build --release --target wasm32-unknown-unknown -p "$crate"
+          done
