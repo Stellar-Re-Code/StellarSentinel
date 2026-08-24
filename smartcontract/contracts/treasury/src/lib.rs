@@ -4,13 +4,21 @@
 extern crate std;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, contracterror, symbol_short,
+    contract, contractclient, contractimpl, contracttype, contracterror, symbol_short,
     token,
     Address, Env, Symbol, Vec,
     log,
 };
 
-use stellar_sentinel_access_control::AccessControlContractClient;
+// Declared locally instead of importing access-control's own generated
+// client: pulling in that crate's `#[contractimpl]` also pulls its
+// wasm-exported symbols (e.g. `initialize`, `upgrade`) into this contract's
+// build, which collide with this contract's own exports of the same name.
+#[contractclient(name = "AclClient")]
+pub trait AclInterface {
+    fn is_admin_or_above(env: Env, address: Address) -> bool;
+    fn is_member_or_above(env: Env, address: Address) -> bool;
+}
 
 // ============================================================================
 // Error Codes
@@ -234,7 +242,7 @@ impl TreasuryContract {
         }
 
         // Verify admin has Admin+ role in ACL
-        let acl_client = AccessControlContractClient::new(&env, &acl_address);
+        let acl_client = AclClient::new(&env, &acl_address);
         if !acl_client.is_admin_or_above(&admin) {
             return Err(Error::Unauthorized);
         }
@@ -1146,13 +1154,13 @@ impl TreasuryContract {
         Ok(())
     }
 
-    fn get_acl(env: &Env) -> Result<AccessControlContractClient, Error> {
+    fn get_acl(env: &Env) -> Result<AclClient, Error> {
         let acl_address: Address = env
             .storage()
             .instance()
             .get(&DataKey::AclAddress)
             .ok_or(Error::NotInitialized)?;
-        Ok(AccessControlContractClient::new(env, &acl_address))
+        Ok(AclClient::new(env, &acl_address))
     }
 
     fn require_acl_admin_or_above(env: &Env, caller: &Address) -> Result<(), Error> {

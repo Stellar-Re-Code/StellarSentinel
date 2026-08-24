@@ -4,13 +4,53 @@
 extern crate std;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, contracterror, symbol_short,
+    contract, contractclient, contractimpl, contracttype, contracterror, symbol_short,
     Address, Env, Symbol, Vec,
     log,
 };
 
-use stellar_sentinel_access_control::AccessControlContractClient;
-use stellar_sentinel_treasury::{TreasuryConfig, TreasuryContractClient};
+// Declared locally instead of importing access-control's / treasury's own
+// generated clients (and treasury's `TreasuryConfig`): pulling in those
+// crates' `#[contractimpl]` also pulls their wasm-exported symbols (e.g.
+// `initialize`, `upgrade`, `get_config`) into this contract's build,
+// colliding with this contract's own exports of the same name at link time.
+#[contractclient(name = "AclClient")]
+pub trait AclInterface {
+    fn is_admin_or_above(env: Env, address: Address) -> bool;
+    fn is_member_or_above(env: Env, address: Address) -> bool;
+}
+
+/// Mirrors `stellar_sentinel_treasury::TreasuryConfig` field-for-field so it
+/// decodes correctly across the cross-contract call, without linking that
+/// crate's contract implementation into this binary.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryConfig {
+    pub admin: Address,
+    pub asset: Address,
+    pub threshold: u32,
+    pub signer_count: u32,
+    pub balance: i128,
+    pub tx_count: u64,
+    pub policy_version: u32,
+}
+
+#[contractclient(name = "TreasuryClient")]
+pub trait TreasuryInterface {
+    fn execute_governance_withdrawal(
+        env: Env,
+        governance: Address,
+        treasury_id: Address,
+        proposal_id: u64,
+        to: Address,
+        asset: Address,
+        amount: i128,
+        policy_version: u32,
+        expires_at: u64,
+    ) -> Result<(), Error>;
+
+    fn get_config(env: Env) -> Result<TreasuryConfig, Error>;
+}
 
 // ============================================================================
 // Error Codes
@@ -207,7 +247,7 @@ impl GovernanceContract {
             return Err(Error::AlreadyInitialized);
         }
 
-        let acl_client = AccessControlContractClient::new(&env, &acl_address);
+        let acl_client = AclClient::new(&env, &acl_address);
         if !acl_client.is_admin_or_above(&admin) {
             return Err(Error::Unauthorized);
         }
@@ -557,7 +597,7 @@ impl GovernanceContract {
                 let cfg = Self::get_treasury_config(&env, &treasury_address)?;
 
                 let treasury_client =
-                    TreasuryContractClient::new(&env, &treasury_address);
+                    TreasuryClient::new(&env, &treasury_address);
 
                 match treasury_client.try_execute_governance_withdrawal(
                     &env.current_contract_address(),
@@ -786,13 +826,13 @@ impl GovernanceContract {
         Ok(())
     }
 
-    fn get_acl(env: &Env) -> Result<AccessControlContractClient, Error> {
+    fn get_acl(env: &Env) -> Result<AclClient, Error> {
         let acl_address: Address = env
             .storage()
             .instance()
             .get(&DataKey::AclAddress)
             .ok_or(Error::NotInitialized)?;
-        Ok(AccessControlContractClient::new(env, &acl_address))
+        Ok(AclClient::new(env, &acl_address))
     }
 
     fn require_acl_admin_or_above(env: &Env, caller: &Address) -> Result<(), Error> {
@@ -846,7 +886,7 @@ impl GovernanceContract {
     /// Query the treasury's config, collapsing both the invoke-level and
     /// contract-level error cases into a single `TreasuryUnavailable`.
     fn get_treasury_config(env: &Env, treasury_address: &Address) -> Result<TreasuryConfig, Error> {
-        let treasury_client = TreasuryContractClient::new(env, treasury_address);
+        let treasury_client = TreasuryClient::new(env, treasury_address);
         match treasury_client.try_get_config() {
             Ok(Ok(cfg)) => Ok(cfg),
             _ => Err(Error::TreasuryUnavailable),
