@@ -178,6 +178,36 @@ export function makeTreasuryThresholdEvent(threshold: number, ledger = '1010'): 
   return ev;
 }
 
+// ── Vault fixtures (issue #79) ──────────────────────────────────────────────
+
+export function makeVaultLockEvent(
+  lockId: bigint, owner: string, amount: bigint, ledger = '3000'
+): RawSorobanEvent {
+  const ev = baseEvent(
+    CONTRACT_ID,
+    [sym('vault'), sym('lock')],
+    vec(xdr.ScVal.scvU64(xdr.Uint64.fromString(lockId.toString())),
+        xdr.ScVal.scvString(Buffer.from(owner)),
+        i128(amount)),
+  );
+  ev.ledger = ledger;
+  return ev;
+}
+
+export function makeVaultClaimEvent(
+  lockId: bigint, owner: string, amount: bigint, ledger = '3001'
+): RawSorobanEvent {
+  const ev = baseEvent(
+    CONTRACT_ID,
+    [sym('vault'), sym('claim')],
+    vec(xdr.ScVal.scvU64(xdr.Uint64.fromString(lockId.toString())),
+        xdr.ScVal.scvString(Buffer.from(owner)),
+        i128(amount)),
+  );
+  ev.ledger = ledger;
+  return ev;
+}
+
 export function makeMalformedEvent(ledger = '1000'): RawSorobanEvent {
   return baseEvent(
     CONTRACT_ID,

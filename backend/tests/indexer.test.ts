@@ -8,8 +8,10 @@ import {
   makeTreasuryExecuteEvent, makeTreasuryCancelEvent, makeTreasuryRevokeEvent,
   makeTreasuryAddSignerEvent, makeTreasuryThresholdEvent,
   makeMalformedEvent, makeUnknownNamespaceEvent,
+  makeVaultLockEvent, makeVaultClaimEvent,
   SIGNER1, SIGNER2, ADMIN, CONTRACT_ID,
 } from './fixtures';
+import { handleVaultEvent } from '../src/indexer/handlers/vault';
 
 function testConfig(overrides: Partial<Config> = {}): Config {
   return {
@@ -417,5 +419,62 @@ describe('Indexer — halt state (production code path via Reconciler)', () => {
 
     db.clearHalt();
     expect(db.isHalted()).toBe(false);
+  });
+});
+
+// ── Issue #79: out-of-order delivery & vault schedule derived state ─────────
+
+describe('Indexer — out-of-order delivery (order-aware derived state)', () => {
+  let db: Db;
+
+  beforeEach(() => { db = new Db(':memory:'); });
+  afterEach(() => { db.close(); });
+
+  it('applies out-of-order events to the same final state as in-order delivery', () => {
+    const lock = makeVaultLockEvent(1n, SIGNER1, 1000n, '3000');
+    const claim = makeVaultClaimEvent(1n, SIGNER1, 250n, '3010');
+
+    // Deliver OUT of order: claim first, then the older lock.
+    for (const raw of [claim, lock]) {
+      const result = parseEvent(raw, 'vault');
+      expect(result.ok).toBe(true);
+      const inserted = db.insertEvent((result as any).event);
+      if (inserted) handleVaultEvent(db, (result as any).event);
+    }
+
+    // Both events indexed exactly once...
+    expect(db.getEventsByContract(CONTRACT_ID)).toHaveLength(2);
+
+    // ...and the stale-delivered lock (ledger 3000 < stored 3010) did NOT roll
+    // the claimed amount back — order-aware guard keeps state correct.
+    const schedules = db.getVaultSchedules(CONTRACT_ID);
+    expect(schedules).toHaveLength(1);
+    expect(schedules[0].claimed_amount).toBe('250');
+    expect(schedules[0].total_amount).toBe('1000');
+  });
+
+  it('replaying the identical event range changes nothing', () => {
+    const events = [
+      makeVaultLockEvent(2n, SIGNER1, 500n, '3000'),
+      makeVaultClaimEvent(2n, SIGNER1, 125n, '3010'),
+    ];
+
+    const run = () => {
+      for (const raw of events) {
+        const result = parseEvent(raw, 'vault');
+        if (!result.ok) continue;
+        if (db.insertEvent((result as any).event)) {
+          handleVaultEvent(db, (result as any).event);
+        }
+      }
+    };
+
+    run();
+    run(); // full replay of the same range
+    run();
+
+    expect(db.getEventsByContract(CONTRACT_ID)).toHaveLength(2); // no duplicate rows
+    const schedules = db.getVaultSchedules(CONTRACT_ID);
+    expect(schedules[0].claimed_amount).toBe('125'); // derived state unchanged by replays
   });
 });

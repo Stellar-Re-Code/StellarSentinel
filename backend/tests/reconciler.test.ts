@@ -5,8 +5,10 @@ import { handleTreasuryEvent } from '../src/indexer/handlers/treasury';
 import {
   makeTreasuryDepositEvent, makeTreasuryProposeEvent,
   makeTreasuryApproveEvent, makeTreasuryExecuteEvent,
+  makeVaultLockEvent, makeVaultClaimEvent,
   SIGNER1, SIGNER2, CONTRACT_ID,
 } from './fixtures';
+import { handleVaultEvent } from '../src/indexer/handlers/vault';
 
 function ingest(db: Db, raw: ReturnType<typeof makeTreasuryDepositEvent>): void {
   const result = parseEvent(raw, 'treasury');
@@ -153,5 +155,91 @@ describe('Reconciler — halt on divergence', () => {
 
     db.clearHalt();
     expect(db.isHalted()).toBe(false);
+  });
+});
+
+// ── Issue #79: proposal & vault reconciliation with identifiers ─────────────
+
+describe('Reconciler — proposal status reconciliation (issue #79)', () => {
+  let db: Db;
+  beforeEach(() => { db = new Db(':memory:'); });
+  afterEach(() => { db.close(); });
+
+  it('reports mismatched proposals with contract and proposal identifiers', async () => {
+    // Index a proposal as 'proposed' via its events.
+    ingest(db, makeTreasuryProposeEvent(11n, SIGNER1, SIGNER2, 500n));
+    ingest(db, makeTreasuryApproveEvent(11n, SIGNER1, 1));
+
+    const reconciler = new Reconciler({
+      rpcUrl: 'http://localhost:8000',
+      networkPassphrase: 'Test SDF Network ; September 2015',
+      treasuryContractId: CONTRACT_ID,
+      onChainBalanceGetter: async () => ({ balance: '1000', ledger: 9999 }),
+      // On-chain says proposal #11 is already executed — indexed says proposed.
+      onChainProposalStatuses: async () => [{ proposalId: '11', status: 'executed' }],
+    });
+
+    await reconciler.reconcile(db);
+
+    const results = db.getReconciliationResults(50)
+      .filter((r) => r.status === 'mismatch' && r.detail?.includes('proposal_id=11'));
+    expect(results.length).toBeGreaterThanOrEqual(1);
+    expect(results[0].contract_id).toBe(CONTRACT_ID);
+    expect(results[0].detail).toContain("indexed='approved'");
+    expect(results[0].detail).toContain("on_chain='executed'");
+    expect(results[0].detail).toContain('checkpoint_event_id=');
+  });
+
+  it('records no proposal rows when statuses agree', async () => {
+    ingest(db, makeTreasuryProposeEvent(12n, SIGNER1, SIGNER2, 300n));
+
+    const reconciler = new Reconciler({
+      rpcUrl: 'http://localhost:8000',
+      networkPassphrase: 'Test SDF Network ; September 2015',
+      treasuryContractId: CONTRACT_ID,
+      onChainBalanceGetter: async () => ({ balance: '1000', ledger: 9999 }),
+      onChainProposalStatuses: async () => [{ proposalId: '12', status: 'proposed' }],
+    });
+
+    await reconciler.reconcile(db);
+
+    const mismatches = db.getReconciliationResults(50)
+      .filter((r) => r.detail?.includes('Proposal status mismatch'));
+    expect(mismatches).toHaveLength(0);
+  });
+});
+
+describe('Reconciler — vault schedule reconciliation (issue #79)', () => {
+  let db: Db;
+  beforeEach(() => { db = new Db(':memory:'); });
+  afterEach(() => { db.close(); });
+
+  it('reports vault remaining mismatches with vault identifiers', async () => {
+    // Derived state: lock 1000, claim 250 → remaining should be 750 on-chain.
+    const lock = makeVaultLockEvent(1n, SIGNER1, 1000n, '3000');
+    const claim = makeVaultClaimEvent(1n, SIGNER1, 250n, '3010');
+    for (const raw of [lock, claim]) {
+      const result = parseEvent(raw, 'vault');
+      if (result.ok && db.insertEvent(result.event)) handleVaultEvent(db, result.event);
+    }
+
+    const reconciler = new Reconciler({
+      rpcUrl: 'http://localhost:8000',
+      networkPassphrase: 'Test SDF Network ; September 2015',
+      treasuryContractId: CONTRACT_ID,
+      onChainBalanceGetter: async () => ({ balance: '100000', ledger: 9999 }),
+      // On-chain says only 100 remains — indexed says 750.
+      onChainVaultRemainings: async () => [{ vaultId: '1', remaining: '100' }],
+    });
+
+    await reconciler.reconcile(db);
+
+    const results = db.getReconciliationResults(50)
+      .filter((r) => r.detail?.includes('vault_id=1'));
+    expect(results.length).toBeGreaterThanOrEqual(1);
+    expect(results[0].indexed_balance).toBe('750');
+    expect(results[0].on_chain_balance).toBe('100');
+    expect(results[0].discrepancy).toBe('-650');
+    expect(results[0].detail).toContain(`contract_id=${CONTRACT_ID}`);
   });
 });
