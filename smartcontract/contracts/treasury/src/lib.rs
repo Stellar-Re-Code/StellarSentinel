@@ -4,13 +4,21 @@
 extern crate std;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, contracterror, symbol_short,
+    contract, contractclient, contractimpl, contracttype, contracterror, symbol_short,
     token,
     Address, Env, Symbol, Vec,
     log,
 };
 
-use stellar_sentinel_access_control::AccessControlContractClient;
+// Declared locally instead of importing access-control's own generated
+// client: pulling in that crate's `#[contractimpl]` also pulls its
+// wasm-exported symbols (e.g. `initialize`, `upgrade`) into this contract's
+// build, which collide with this contract's own exports of the same name.
+#[contractclient(name = "AclClient")]
+pub trait AclInterface {
+    fn is_admin_or_above(env: Env, address: Address) -> bool;
+    fn is_member_or_above(env: Env, address: Address) -> bool;
+}
 
 // ============================================================================
 // Error Codes
@@ -59,6 +67,16 @@ pub enum Error {
     PolicyInvalidated = 18,
     /// Duplicate signer in initialization or addition.
     DuplicateSigner = 19,
+    /// Caller is not the registered governance contract for this treasury.
+    GovernanceUnauthorized = 20,
+    /// The asset in the authorization payload does not match this treasury's bound asset.
+    AssetMismatch = 21,
+    /// The treasury ID in the authorization payload does not match this contract.
+    TreasuryMismatch = 22,
+    /// The governance-issued authorization has expired.
+    AuthorizationExpired = 23,
+    /// This (governance, proposal) authorization has already been executed.
+    AuthorizationReplayed = 24,
 }
 
 // ============================================================================
@@ -89,6 +107,14 @@ pub enum DataKey {
     PolicyVersion,
     /// The access-control contract address for RBAC enforcement.
     AclAddress,
+    /// The governance contract authorized to trigger direct, atomic
+    /// withdrawals via `execute_governance_withdrawal`. Distinct from
+    /// `Signers` — holding this role does not grant multi-sig voting
+    /// rights over ordinary treasury proposals.
+    GovernanceAddress,
+    /// Replay guard + audit receipt for a governance-authorized
+    /// withdrawal, keyed by (governance contract, proposal id).
+    GovExecuted(Address, u64),
 }
 
 /// A pending transaction proposal in the multi-sig treasury.
@@ -137,6 +163,27 @@ pub struct TreasuryConfig {
     pub tx_count: u64,
     /// Current policy version.
     pub policy_version: u32,
+}
+
+/// Audit receipt for a governance-authorized withdrawal. Stored per
+/// (governance, proposal_id) once executed so an indexer or a later
+/// on-chain query can reconstruct the proposal-to-withdrawal link
+/// without relying solely on the event stream.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernanceWithdrawalReceipt {
+    /// The governance proposal ID this withdrawal was authorized under.
+    pub proposal_id: u64,
+    /// The governance contract that authorized the withdrawal.
+    pub governance: Address,
+    /// The destination address.
+    pub to: Address,
+    /// The amount transferred.
+    pub amount: i128,
+    /// The treasury policy version the authorization was validated against.
+    pub policy_version: u32,
+    /// The ledger sequence at which the withdrawal executed.
+    pub ledger: u32,
 }
 
 // ============================================================================
@@ -195,7 +242,7 @@ impl TreasuryContract {
         }
 
         // Verify admin has Admin+ role in ACL
-        let acl_client = AccessControlContractClient::new(&env, &acl_address);
+        let acl_client = AclClient::new(&env, &acl_address);
         if !acl_client.is_admin_or_above(&admin) {
             return Err(Error::Unauthorized);
         }
@@ -552,6 +599,207 @@ impl TreasuryContract {
         Ok(())
     }
 
+    // ========================================================================
+    // Governance-Authorized Withdrawal
+    // ========================================================================
+
+    /// Execute an atomic, governance-authorized withdrawal.
+    ///
+    /// This is a separate path from the multi-sig `propose_withdrawal` /
+    /// `approve` / `execute` flow: it lets the registered governance
+    /// contract (see `set_governance`) move funds in a single call once
+    /// its own on-chain vote/quorum process has passed a Funding
+    /// proposal. No additional treasury signer approval step is
+    /// involved, and no off-chain signature can substitute for it —
+    /// `governance` must itself be the caller of this function, which
+    /// Soroban only allows for the actual invoking contract.
+    ///
+    /// The authorization payload is bound to `proposal_id`,
+    /// `treasury_id`, `to`, `asset`, `amount`, `policy_version`, and
+    /// `expires_at`. Every field is re-verified against live treasury
+    /// state immediately before the transfer, and the transfer itself
+    /// always moves this treasury's own bound asset — the caller-
+    /// supplied `asset` is only ever used as a binding check, never to
+    /// select which token moves:
+    /// - `governance` must equal the registered governance address.
+    /// - `treasury_id` must equal this contract's own address.
+    /// - `asset` must equal this treasury's bound asset.
+    /// - `policy_version` must equal the treasury's current policy
+    ///   version — any signer/threshold/governance change since the
+    ///   proposal was authorized invalidates it.
+    /// - `expires_at` must not have passed.
+    /// - `(governance, proposal_id)` must not have been executed
+    ///   before. This is the replay guard; a failed attempt (e.g.
+    ///   insufficient funds) does not consume it, so it can be retried
+    ///   once the underlying condition is fixed.
+    ///
+    /// The token transfer and the execution-state change (balance
+    /// update + replay-guard receipt) happen in the same invocation,
+    /// which Soroban commits atomically — a panic or early `Err`
+    /// return leaves no partial state in either contract.
+    ///
+    /// # Errors
+    /// * `Error::NotInitialized`
+    /// * `Error::GovernanceUnauthorized` - `governance` is not the registered governance contract.
+    /// * `Error::TreasuryMismatch` - `treasury_id` does not match this contract.
+    /// * `Error::InvalidAmount` - `amount` is zero or negative.
+    /// * `Error::AssetMismatch` - `asset` does not match the treasury's bound asset.
+    /// * `Error::AuthorizationExpired` - `expires_at` has passed.
+    /// * `Error::PolicyInvalidated` - `policy_version` is stale.
+    /// * `Error::AuthorizationReplayed` - this proposal was already executed.
+    /// * `Error::InsufficientFunds` - tracked or real token balance is too low.
+    pub fn execute_governance_withdrawal(
+        env: Env,
+        governance: Address,
+        treasury_id: Address,
+        proposal_id: u64,
+        to: Address,
+        asset: Address,
+        amount: i128,
+        policy_version: u32,
+        expires_at: u64,
+    ) -> Result<(), Error> {
+        Self::require_initialized(&env)?;
+
+        governance.require_auth();
+
+        let authorized_governance: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceAddress)
+            .ok_or(Error::GovernanceUnauthorized)?;
+        if governance != authorized_governance {
+            return Err(Error::GovernanceUnauthorized);
+        }
+
+        if treasury_id != env.current_contract_address() {
+            return Err(Error::TreasuryMismatch);
+        }
+
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let bound_asset: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Asset)
+            .ok_or(Error::NotInitialized)?;
+        if asset != bound_asset {
+            return Err(Error::AssetMismatch);
+        }
+
+        if env.ledger().timestamp() > expires_at {
+            return Err(Error::AuthorizationExpired);
+        }
+
+        let current_policy_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PolicyVersion)
+            .unwrap_or(1);
+        if policy_version != current_policy_version {
+            return Err(Error::PolicyInvalidated);
+        }
+
+        let replay_key = DataKey::GovExecuted(governance.clone(), proposal_id);
+        if env.storage().persistent().has(&replay_key) {
+            return Err(Error::AuthorizationReplayed);
+        }
+
+        let current_balance: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Balance)
+            .unwrap_or(0);
+        if current_balance < amount {
+            return Err(Error::InsufficientFunds);
+        }
+
+        // Perform the real asset transfer before state mutation — atomic
+        // with the whole invocation, same reasoning as `execute()`.
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &bound_asset);
+
+        let contract_token_balance = token_client.balance(&contract_address);
+        if contract_token_balance < amount {
+            return Err(Error::InsufficientFunds);
+        }
+
+        token_client.transfer(&contract_address, &to, &amount);
+
+        // Mark executed and deduct tracked balance — durable and terminal.
+        let new_balance = current_balance - amount;
+        env.storage().instance().set(&DataKey::Balance, &new_balance);
+
+        let receipt = GovernanceWithdrawalReceipt {
+            proposal_id,
+            governance: governance.clone(),
+            to: to.clone(),
+            amount,
+            policy_version,
+            ledger: env.ledger().sequence(),
+        };
+        env.storage().persistent().set(&replay_key, &receipt);
+
+        // Emit an event carrying every bound field so an indexer can
+        // reconstruct the proposal-to-withdrawal link independently of
+        // the governance contract's own event stream.
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("gov_wd")),
+            (proposal_id, governance.clone(), to.clone(), amount, policy_version, new_balance),
+        );
+
+        log!(&env, "Governance withdrawal for proposal #{}: {} to {:?}", proposal_id, amount, to);
+        Ok(())
+    }
+
+    /// Register the governance contract authorized to trigger direct,
+    /// atomic withdrawals via `execute_governance_withdrawal`. Only the
+    /// admin can set this.
+    ///
+    /// Changing the authorized governance address is a policy change:
+    /// it bumps the policy version, which invalidates any pending
+    /// multi-sig `Transaction` or governance authorization snapshotted
+    /// under the old policy.
+    pub fn set_governance(env: Env, admin: Address, governance: Address) -> Result<(), Error> {
+        Self::require_initialized(&env)?;
+        Self::require_admin(&env, &admin)?;
+
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernanceAddress, &governance);
+
+        let mut policy_version: u32 = env.storage().instance().get(&DataKey::PolicyVersion).unwrap_or(1);
+        policy_version += 1;
+        env.storage().instance().set(&DataKey::PolicyVersion, &policy_version);
+
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("gov_set")),
+            (governance, policy_version),
+        );
+
+        Ok(())
+    }
+
+    /// Get the registered governance contract, if any.
+    pub fn get_governance(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::GovernanceAddress)
+    }
+
+    /// Get the audit receipt for a governance-authorized withdrawal, if executed.
+    pub fn get_governance_withdrawal(
+        env: Env,
+        governance: Address,
+        proposal_id: u64,
+    ) -> Option<GovernanceWithdrawalReceipt> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GovExecuted(governance, proposal_id))
+    }
+
     /// Revoke a previous approval for a transaction.
     /// Can only be done before execution.
     pub fn revoke_approval(env: Env, signer: Address, tx_id: u64) -> Result<u32, Error> {
@@ -906,13 +1154,13 @@ impl TreasuryContract {
         Ok(())
     }
 
-    fn get_acl(env: &Env) -> Result<AccessControlContractClient, Error> {
+    fn get_acl(env: &Env) -> Result<AclClient, Error> {
         let acl_address: Address = env
             .storage()
             .instance()
             .get(&DataKey::AclAddress)
             .ok_or(Error::NotInitialized)?;
-        Ok(AccessControlContractClient::new(env, &acl_address))
+        Ok(AclClient::new(env, &acl_address))
     }
 
     fn require_acl_admin_or_above(env: &Env, caller: &Address) -> Result<(), Error> {
@@ -1469,5 +1717,221 @@ mod test {
 
         let recipient_balance_after: i128 = token_client.balance(&recipient);
         assert_eq!(recipient_balance_after, recipient_balance_before);
+    }
+
+    // ========================================================================
+    // Governance-authorized withdrawal
+    // ========================================================================
+
+    fn setup_governance_treasury(
+        init_balance: i128,
+    ) -> (Env, Address, Address, TreasuryContractClient<'static>, Address, Address, token::StellarAssetClient<'static>) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let acl_id = deploy_acl(&env, &admin);
+        let signer1 = Address::generate(&env);
+        let signers = Vec::from_array(&env, [signer1.clone()]);
+
+        let asset_contract = env.register_stellar_asset_contract_v2(admin.clone());
+        let asset = asset_contract.address();
+        let contract_id = env.register_contract(None, TreasuryContract);
+        let client = TreasuryContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &asset, &1, &signers, &acl_id);
+
+        let sac_client = token::StellarAssetClient::new(&env, &asset);
+        if init_balance > 0 {
+            sac_client.mint(&contract_id, &init_balance);
+            sac_client.mint(&signer1, &init_balance);
+            client.deposit(&signer1, &init_balance);
+        }
+
+        let governance = Address::generate(&env);
+        client.set_governance(&admin, &governance);
+
+        (env, admin, acl_id, client, contract_id, governance, sac_client)
+    }
+
+    #[test]
+    fn test_governance_withdrawal_executes_atomically() {
+        let (env, _admin, _acl_id, client, contract_id, governance, _sac) =
+            setup_governance_treasury(5_000_000);
+        let recipient = Address::generate(&env);
+        let asset = client.get_config().asset;
+        let policy_version = client.get_config().policy_version;
+        let expires_at = env.ledger().timestamp() + 3600;
+
+        let token_client = token::Client::new(&env, &asset);
+        let recipient_before = token_client.balance(&recipient);
+
+        client.execute_governance_withdrawal(
+            &governance, &contract_id, &1, &recipient, &asset,
+            &2_000_000, &policy_version, &expires_at,
+        );
+
+        assert_eq!(token_client.balance(&recipient), recipient_before + 2_000_000);
+        assert_eq!(client.get_balance(), 3_000_000);
+
+        let receipt = client.get_governance_withdrawal(&governance, &1).unwrap();
+        assert_eq!(receipt.amount, 2_000_000);
+        assert_eq!(receipt.to, recipient);
+    }
+
+    #[test]
+    fn test_governance_withdrawal_replay_rejected() {
+        let (env, _admin, _acl_id, client, contract_id, governance, _sac) =
+            setup_governance_treasury(5_000_000);
+        let recipient = Address::generate(&env);
+        let asset = client.get_config().asset;
+        let policy_version = client.get_config().policy_version;
+        let expires_at = env.ledger().timestamp() + 3600;
+
+        client.execute_governance_withdrawal(
+            &governance, &contract_id, &1, &recipient, &asset,
+            &2_000_000, &policy_version, &expires_at,
+        );
+
+        // Same proposal_id replayed — even with identical parameters — must fail.
+        assert_eq!(
+            client.try_execute_governance_withdrawal(
+                &governance, &contract_id, &1, &recipient, &asset,
+                &2_000_000, &policy_version, &expires_at,
+            ),
+            Err(Ok(Error::AuthorizationReplayed))
+        );
+        assert_eq!(client.get_balance(), 3_000_000);
+    }
+
+    #[test]
+    fn test_governance_withdrawal_unauthorized_caller_rejected() {
+        let (env, _admin, _acl_id, client, contract_id, _governance, _sac) =
+            setup_governance_treasury(5_000_000);
+        let recipient = Address::generate(&env);
+        let asset = client.get_config().asset;
+        let policy_version = client.get_config().policy_version;
+        let expires_at = env.ledger().timestamp() + 3600;
+
+        let impostor = Address::generate(&env);
+        assert_eq!(
+            client.try_execute_governance_withdrawal(
+                &impostor, &contract_id, &1, &recipient, &asset,
+                &2_000_000, &policy_version, &expires_at,
+            ),
+            Err(Ok(Error::GovernanceUnauthorized))
+        );
+        assert_eq!(client.get_balance(), 5_000_000);
+    }
+
+    #[test]
+    fn test_governance_withdrawal_wrong_treasury_id_rejected() {
+        let (env, _admin, _acl_id, client, _contract_id, governance, _sac) =
+            setup_governance_treasury(5_000_000);
+        let recipient = Address::generate(&env);
+        let asset = client.get_config().asset;
+        let policy_version = client.get_config().policy_version;
+        let expires_at = env.ledger().timestamp() + 3600;
+
+        let wrong_treasury = Address::generate(&env);
+        assert_eq!(
+            client.try_execute_governance_withdrawal(
+                &governance, &wrong_treasury, &1, &recipient, &asset,
+                &2_000_000, &policy_version, &expires_at,
+            ),
+            Err(Ok(Error::TreasuryMismatch))
+        );
+        assert_eq!(client.get_balance(), 5_000_000);
+    }
+
+    #[test]
+    fn test_governance_withdrawal_asset_mismatch_rejected() {
+        let (env, _admin, _acl_id, client, contract_id, governance, _sac) =
+            setup_governance_treasury(5_000_000);
+        let recipient = Address::generate(&env);
+        let policy_version = client.get_config().policy_version;
+        let expires_at = env.ledger().timestamp() + 3600;
+
+        let wrong_asset = Address::generate(&env);
+        assert_eq!(
+            client.try_execute_governance_withdrawal(
+                &governance, &contract_id, &1, &recipient, &wrong_asset,
+                &2_000_000, &policy_version, &expires_at,
+            ),
+            Err(Ok(Error::AssetMismatch))
+        );
+        assert_eq!(client.get_balance(), 5_000_000);
+    }
+
+    #[test]
+    fn test_governance_withdrawal_expired_rejected() {
+        let (env, _admin, _acl_id, client, contract_id, governance, _sac) =
+            setup_governance_treasury(5_000_000);
+        let recipient = Address::generate(&env);
+        let asset = client.get_config().asset;
+        let policy_version = client.get_config().policy_version;
+        let expires_at = env.ledger().timestamp() + 100;
+
+        env.ledger().set_timestamp(expires_at + 1);
+
+        assert_eq!(
+            client.try_execute_governance_withdrawal(
+                &governance, &contract_id, &1, &recipient, &asset,
+                &2_000_000, &policy_version, &expires_at,
+            ),
+            Err(Ok(Error::AuthorizationExpired))
+        );
+        assert_eq!(client.get_balance(), 5_000_000);
+    }
+
+    #[test]
+    fn test_governance_withdrawal_stale_policy_rejected() {
+        let (env, admin, _acl_id, client, contract_id, governance, _sac) =
+            setup_governance_treasury(5_000_000);
+        let recipient = Address::generate(&env);
+        let asset = client.get_config().asset;
+        let stale_policy_version = client.get_config().policy_version;
+        let expires_at = env.ledger().timestamp() + 3600;
+
+        // Any signer/threshold/governance change bumps policy_version.
+        let new_signer = Address::generate(&env);
+        client.add_signer(&admin, &new_signer);
+
+        assert_eq!(
+            client.try_execute_governance_withdrawal(
+                &governance, &contract_id, &1, &recipient, &asset,
+                &2_000_000, &stale_policy_version, &expires_at,
+            ),
+            Err(Ok(Error::PolicyInvalidated))
+        );
+        assert_eq!(client.get_balance(), 5_000_000);
+    }
+
+    #[test]
+    fn test_governance_withdrawal_insufficient_funds_does_not_consume_replay_guard() {
+        let (env, _admin, _acl_id, client, contract_id, governance, _sac) =
+            setup_governance_treasury(1_000_000);
+        let recipient = Address::generate(&env);
+        let asset = client.get_config().asset;
+        let policy_version = client.get_config().policy_version;
+        let expires_at = env.ledger().timestamp() + 3600;
+
+        // First attempt asks for more than the treasury holds — must fail
+        // without marking the (governance, proposal_id) pair as executed.
+        assert_eq!(
+            client.try_execute_governance_withdrawal(
+                &governance, &contract_id, &1, &recipient, &asset,
+                &2_000_000, &policy_version, &expires_at,
+            ),
+            Err(Ok(Error::InsufficientFunds))
+        );
+        assert_eq!(client.get_balance(), 1_000_000);
+        assert!(client.get_governance_withdrawal(&governance, &1).is_none());
+
+        // A smaller, satisfiable amount for the same proposal_id now succeeds.
+        client.execute_governance_withdrawal(
+            &governance, &contract_id, &1, &recipient, &asset,
+            &500_000, &policy_version, &expires_at,
+        );
+        assert_eq!(client.get_balance(), 500_000);
     }
 }
