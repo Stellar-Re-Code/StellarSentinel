@@ -4,10 +4,8 @@
 extern crate std;
 
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, contracterror, symbol_short,
-    token,
+    contract, contractclient, contracterror, contractimpl, contracttype, log, symbol_short, token,
     Address, Env, Symbol, Vec,
-    log,
 };
 
 // Declared locally instead of importing access-control's own generated
@@ -77,6 +75,16 @@ pub enum Error {
     AuthorizationExpired = 23,
     /// This (governance, proposal) authorization has already been executed.
     AuthorizationReplayed = 24,
+    /// New withdrawal operations are paused by threshold-authorized signers.
+    TreasuryPaused = 25,
+    /// Emergency pause proposal was not found.
+    PauseRequestNotFound = 26,
+    /// Signer already approved this emergency pause proposal.
+    PauseAlreadyApproved = 27,
+    /// Emergency pause proposal has already been executed.
+    PauseRequestExecuted = 28,
+    /// Emergency pause proposal does not transition the current pause state.
+    InvalidPauseTransition = 29,
 }
 
 // ============================================================================
@@ -115,6 +123,12 @@ pub enum DataKey {
     /// Replay guard + audit receipt for a governance-authorized
     /// withdrawal, keyed by (governance contract, proposal id).
     GovExecuted(Address, u64),
+    /// Current emergency pause state and its monotonic version.
+    PauseState,
+    /// Counter for emergency pause proposal IDs.
+    PauseCounter,
+    /// Emergency pause proposal by ID.
+    PauseRequest(u64),
 }
 
 /// A pending transaction proposal in the multi-sig treasury.
@@ -186,6 +200,26 @@ pub struct GovernanceWithdrawalReceipt {
     pub ledger: u32,
 }
 
+/// The externally visible emergency control state. `version` increases on
+/// every successful pause or unpause transition for audit correlation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseState {
+    pub paused: bool,
+    pub version: u64,
+}
+
+/// A threshold-authorized request to change the emergency pause state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseRequest {
+    pub id: u64,
+    pub paused: bool,
+    pub approvals: Vec<Address>,
+    pub policy_version: u32,
+    pub executed: bool,
+}
+
 // ============================================================================
 // Contract Implementation
 // ============================================================================
@@ -253,12 +287,28 @@ impl TreasuryContract {
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Asset, &asset);
-        env.storage().instance().set(&DataKey::Threshold, &threshold);
-        env.storage().instance().set(&DataKey::Signers, &unique_signers);
+        env.storage()
+            .instance()
+            .set(&DataKey::Threshold, &threshold);
+        env.storage()
+            .instance()
+            .set(&DataKey::Signers, &unique_signers);
         env.storage().instance().set(&DataKey::Balance, &0_i128);
         env.storage().instance().set(&DataKey::TxCounter, &0_u64);
-        env.storage().instance().set(&DataKey::PolicyVersion, &1_u32);
-        env.storage().instance().set(&DataKey::AclAddress, &acl_address);
+        env.storage()
+            .instance()
+            .set(&DataKey::PolicyVersion, &1_u32);
+        env.storage().instance().set(
+            &DataKey::PauseState,
+            &PauseState {
+                paused: false,
+                version: 0,
+            },
+        );
+        env.storage().instance().set(&DataKey::PauseCounter, &0_u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::AclAddress, &acl_address);
 
         // Emit initialization event
         env.events().publish(
@@ -266,7 +316,13 @@ impl TreasuryContract {
             (admin.clone(), asset.clone(), threshold, signer_count),
         );
 
-        log!(&env, "Treasury initialized with {} signers, threshold {}, asset {:?}", signer_count, threshold, asset);
+        log!(
+            &env,
+            "Treasury initialized with {} signers, threshold {}, asset {:?}",
+            signer_count,
+            threshold,
+            asset
+        );
         Ok(())
     }
 
@@ -299,20 +355,16 @@ impl TreasuryContract {
             .instance()
             .get(&DataKey::Asset)
             .ok_or(Error::NotInitialized)?;
-            
+
         let contract_address = env.current_contract_address();
         let token_client = token::Client::new(&env, &asset);
-        
+
         // Transfer tokens from the depositor to the treasury contract.
         // Requires the depositor to have authorized this transfer.
         token_client.transfer(&from, &contract_address, &amount);
 
         // Update balance tracking
-        let current_balance: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance)
-            .unwrap_or(0);
+        let current_balance: i128 = env.storage().instance().get(&DataKey::Balance).unwrap_or(0);
         let new_balance = current_balance + amount;
         env.storage()
             .instance()
@@ -324,7 +376,13 @@ impl TreasuryContract {
             (from.clone(), amount, new_balance),
         );
 
-        log!(&env, "Deposit of {} from {:?}, new balance: {}", amount, from, new_balance);
+        log!(
+            &env,
+            "Deposit of {} from {:?}, new balance: {}",
+            amount,
+            from,
+            new_balance
+        );
         Ok(())
     }
 
@@ -361,6 +419,7 @@ impl TreasuryContract {
         expires_at: u64,
     ) -> Result<u64, Error> {
         Self::require_initialized(&env)?;
+        Self::require_not_paused(&env)?;
         Self::require_signer(&env, &proposer)?;
 
         proposer.require_auth();
@@ -374,11 +433,7 @@ impl TreasuryContract {
         }
 
         // Check sufficient balance
-        let balance: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance)
-            .unwrap_or(0);
+        let balance: i128 = env.storage().instance().get(&DataKey::Balance).unwrap_or(0);
         if balance < amount {
             return Err(Error::InsufficientFunds);
         }
@@ -390,9 +445,7 @@ impl TreasuryContract {
             .get(&DataKey::TxCounter)
             .unwrap_or(0);
         let next_id = tx_id + 1;
-        env.storage()
-            .instance()
-            .set(&DataKey::TxCounter, &next_id);
+        env.storage().instance().set(&DataKey::TxCounter, &next_id);
 
         // Create initial approval list with proposer
         let mut approvals = Vec::new(&env);
@@ -410,7 +463,11 @@ impl TreasuryContract {
             proposer: proposer.clone(),
             expires_at,
             canceled: false,
-            policy_version: env.storage().instance().get(&DataKey::PolicyVersion).unwrap_or(1),
+            policy_version: env
+                .storage()
+                .instance()
+                .get(&DataKey::PolicyVersion)
+                .unwrap_or(1),
         };
 
         // Store transaction
@@ -424,7 +481,13 @@ impl TreasuryContract {
             (next_id, proposer.clone(), to, amount),
         );
 
-        log!(&env, "Withdrawal proposal #{} created by {:?} for {}", next_id, proposer, amount);
+        log!(
+            &env,
+            "Withdrawal proposal #{} created by {:?} for {}",
+            next_id,
+            proposer,
+            amount
+        );
         Ok(next_id)
     }
 
@@ -447,6 +510,7 @@ impl TreasuryContract {
     /// * `Error::AlreadyExecuted` - If transaction is already executed.
     pub fn approve(env: Env, signer: Address, tx_id: u64) -> Result<u32, Error> {
         Self::require_initialized(&env)?;
+        Self::require_not_paused(&env)?;
         Self::require_signer(&env, &signer)?;
 
         signer.require_auth();
@@ -467,7 +531,11 @@ impl TreasuryContract {
         if env.ledger().timestamp() > transaction.expires_at {
             return Err(Error::TransactionExpired);
         }
-        let current_policy_version: u32 = env.storage().instance().get(&DataKey::PolicyVersion).unwrap_or(1);
+        let current_policy_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PolicyVersion)
+            .unwrap_or(1);
         if transaction.policy_version != current_policy_version {
             return Err(Error::PolicyInvalidated);
         }
@@ -494,7 +562,13 @@ impl TreasuryContract {
             (tx_id, signer.clone(), approval_count),
         );
 
-        log!(&env, "Transaction #{} approved by {:?} ({} approvals)", tx_id, signer, approval_count);
+        log!(
+            &env,
+            "Transaction #{} approved by {:?} ({} approvals)",
+            tx_id,
+            signer,
+            approval_count
+        );
         Ok(approval_count)
     }
 
@@ -516,6 +590,7 @@ impl TreasuryContract {
     /// * `Error::Unauthorized` - If approval threshold not met.
     pub fn execute(env: Env, executor: Address, tx_id: u64) -> Result<(), Error> {
         Self::require_initialized(&env)?;
+        Self::require_not_paused(&env)?;
         Self::require_signer(&env, &executor)?;
 
         executor.require_auth();
@@ -535,7 +610,11 @@ impl TreasuryContract {
         if env.ledger().timestamp() > transaction.expires_at {
             return Err(Error::TransactionExpired);
         }
-        let current_policy_version: u32 = env.storage().instance().get(&DataKey::PolicyVersion).unwrap_or(1);
+        let current_policy_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PolicyVersion)
+            .unwrap_or(1);
         if transaction.policy_version != current_policy_version {
             return Err(Error::PolicyInvalidated);
         }
@@ -551,11 +630,7 @@ impl TreasuryContract {
         }
 
         // Verify internal balance tracking
-        let current_balance: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance)
-            .unwrap_or(0);
+        let current_balance: i128 = env.storage().instance().get(&DataKey::Balance).unwrap_or(0);
         if current_balance < transaction.amount {
             return Err(Error::InsufficientFunds);
         }
@@ -592,10 +667,21 @@ impl TreasuryContract {
         // Emit execution event
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("execute")),
-            (tx_id, transaction.to.clone(), transaction.amount, new_balance),
+            (
+                tx_id,
+                transaction.to.clone(),
+                transaction.amount,
+                new_balance,
+            ),
         );
 
-        log!(&env, "Transaction #{} executed: {} to {:?}", tx_id, transaction.amount, transaction.to);
+        log!(
+            &env,
+            "Transaction #{} executed: {} to {:?}",
+            tx_id,
+            transaction.amount,
+            transaction.to
+        );
         Ok(())
     }
 
@@ -660,6 +746,7 @@ impl TreasuryContract {
         expires_at: u64,
     ) -> Result<(), Error> {
         Self::require_initialized(&env)?;
+        Self::require_not_paused(&env)?;
 
         governance.require_auth();
 
@@ -707,11 +794,7 @@ impl TreasuryContract {
             return Err(Error::AuthorizationReplayed);
         }
 
-        let current_balance: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance)
-            .unwrap_or(0);
+        let current_balance: i128 = env.storage().instance().get(&DataKey::Balance).unwrap_or(0);
         if current_balance < amount {
             return Err(Error::InsufficientFunds);
         }
@@ -730,7 +813,9 @@ impl TreasuryContract {
 
         // Mark executed and deduct tracked balance — durable and terminal.
         let new_balance = current_balance - amount;
-        env.storage().instance().set(&DataKey::Balance, &new_balance);
+        env.storage()
+            .instance()
+            .set(&DataKey::Balance, &new_balance);
 
         let receipt = GovernanceWithdrawalReceipt {
             proposal_id,
@@ -747,10 +832,138 @@ impl TreasuryContract {
         // the governance contract's own event stream.
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("gov_wd")),
-            (proposal_id, governance.clone(), to.clone(), amount, policy_version, new_balance),
+            (
+                proposal_id,
+                governance.clone(),
+                to.clone(),
+                amount,
+                policy_version,
+                new_balance,
+            ),
         );
 
-        log!(&env, "Governance withdrawal for proposal #{}: {} to {:?}", proposal_id, amount, to);
+        log!(
+            &env,
+            "Governance withdrawal for proposal #{}: {} to {:?}",
+            proposal_id,
+            amount,
+            to
+        );
+        Ok(())
+    }
+
+    // ========================================================================
+    // Governed Emergency Pause
+    // ========================================================================
+
+    /// Create a threshold-authorized request to pause or unpause new
+    /// withdrawals. The proposer supplies the first approval. This path stays
+    /// available while paused so the same signer set can recover service.
+    pub fn propose_pause(env: Env, signer: Address, paused: bool) -> Result<u64, Error> {
+        Self::require_initialized(&env)?;
+        Self::require_signer(&env, &signer)?;
+        signer.require_auth();
+
+        let state = Self::pause_state(&env);
+        if state.paused == paused {
+            return Err(Error::InvalidPauseTransition);
+        }
+
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PauseCounter)
+            .unwrap_or(0)
+            + 1;
+        env.storage().instance().set(&DataKey::PauseCounter, &id);
+
+        let mut approvals = Vec::new(&env);
+        approvals.push_back(signer.clone());
+        let request = PauseRequest {
+            id,
+            paused,
+            approvals,
+            policy_version: env
+                .storage()
+                .instance()
+                .get(&DataKey::PolicyVersion)
+                .unwrap_or(1),
+            executed: false,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::PauseRequest(id), &request);
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("pause_pr")),
+            (id, signer, paused, request.policy_version),
+        );
+        Ok(id)
+    }
+
+    /// Record another signer approval for an emergency pause request.
+    pub fn approve_pause(env: Env, signer: Address, request_id: u64) -> Result<u32, Error> {
+        Self::require_initialized(&env)?;
+        Self::require_signer(&env, &signer)?;
+        signer.require_auth();
+
+        let mut request: PauseRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PauseRequest(request_id))
+            .ok_or(Error::PauseRequestNotFound)?;
+        Self::validate_pause_request(&env, &request)?;
+
+        if request.approvals.contains(signer.clone()) {
+            return Err(Error::PauseAlreadyApproved);
+        }
+        request.approvals.push_back(signer.clone());
+        let approval_count = request.approvals.len();
+        env.storage()
+            .persistent()
+            .set(&DataKey::PauseRequest(request_id), &request);
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("pause_ap")),
+            (request_id, signer, approval_count),
+        );
+        Ok(approval_count)
+    }
+
+    /// Apply an approved emergency transition. Only the existing treasury
+    /// signer threshold can change pause state; the request is terminal after
+    /// execution, preventing replay of a prior unpause authorization.
+    pub fn execute_pause(env: Env, signer: Address, request_id: u64) -> Result<(), Error> {
+        Self::require_initialized(&env)?;
+        Self::require_signer(&env, &signer)?;
+        signer.require_auth();
+
+        let mut request: PauseRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PauseRequest(request_id))
+            .ok_or(Error::PauseRequestNotFound)?;
+        Self::validate_pause_request(&env, &request)?;
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .unwrap_or(1);
+        if request.approvals.len() < threshold {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut state = Self::pause_state(&env);
+        state.paused = request.paused;
+        state.version += 1;
+        request.executed = true;
+        env.storage().instance().set(&DataKey::PauseState, &state);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PauseRequest(request_id), &request);
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("pause")),
+            (request_id, state.paused, state.version),
+        );
         Ok(())
     }
 
@@ -772,9 +985,15 @@ impl TreasuryContract {
             .instance()
             .set(&DataKey::GovernanceAddress, &governance);
 
-        let mut policy_version: u32 = env.storage().instance().get(&DataKey::PolicyVersion).unwrap_or(1);
+        let mut policy_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PolicyVersion)
+            .unwrap_or(1);
         policy_version += 1;
-        env.storage().instance().set(&DataKey::PolicyVersion, &policy_version);
+        env.storage()
+            .instance()
+            .set(&DataKey::PolicyVersion, &policy_version);
 
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("gov_set")),
@@ -823,7 +1042,11 @@ impl TreasuryContract {
         if env.ledger().timestamp() > transaction.expires_at {
             return Err(Error::TransactionExpired);
         }
-        let current_policy_version: u32 = env.storage().instance().get(&DataKey::PolicyVersion).unwrap_or(1);
+        let current_policy_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PolicyVersion)
+            .unwrap_or(1);
         if transaction.policy_version != current_policy_version {
             return Err(Error::PolicyInvalidated);
         }
@@ -855,7 +1078,12 @@ impl TreasuryContract {
             (tx_id, signer.clone(), approval_count),
         );
 
-        log!(&env, "Transaction #{} approval revoked by {:?}", tx_id, signer);
+        log!(
+            &env,
+            "Transaction #{} approval revoked by {:?}",
+            tx_id,
+            signer
+        );
         Ok(approval_count)
     }
 
@@ -925,9 +1153,15 @@ impl TreasuryContract {
         signers.push_back(new_signer.clone());
         env.storage().instance().set(&DataKey::Signers, &signers);
 
-        let mut policy_version: u32 = env.storage().instance().get(&DataKey::PolicyVersion).unwrap_or(1);
+        let mut policy_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PolicyVersion)
+            .unwrap_or(1);
         policy_version += 1;
-        env.storage().instance().set(&DataKey::PolicyVersion, &policy_version);
+        env.storage()
+            .instance()
+            .set(&DataKey::PolicyVersion, &policy_version);
 
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("add_sig")),
@@ -982,9 +1216,15 @@ impl TreasuryContract {
             .instance()
             .set(&DataKey::Signers, &new_signers);
 
-        let mut policy_version: u32 = env.storage().instance().get(&DataKey::PolicyVersion).unwrap_or(1);
+        let mut policy_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PolicyVersion)
+            .unwrap_or(1);
         policy_version += 1;
-        env.storage().instance().set(&DataKey::PolicyVersion, &policy_version);
+        env.storage()
+            .instance()
+            .set(&DataKey::PolicyVersion, &policy_version);
 
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("rem_sig")),
@@ -1016,9 +1256,15 @@ impl TreasuryContract {
             .instance()
             .set(&DataKey::Threshold, &new_threshold);
 
-        let mut policy_version: u32 = env.storage().instance().get(&DataKey::PolicyVersion).unwrap_or(1);
+        let mut policy_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PolicyVersion)
+            .unwrap_or(1);
         policy_version += 1;
-        env.storage().instance().set(&DataKey::PolicyVersion, &policy_version);
+        env.storage()
+            .instance()
+            .set(&DataKey::PolicyVersion, &policy_version);
 
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("thresh")),
@@ -1034,10 +1280,7 @@ impl TreasuryContract {
 
     /// Get the current treasury balance.
     pub fn get_balance(env: Env) -> i128 {
-        env.storage()
-            .instance()
-            .get(&DataKey::Balance)
-            .unwrap_or(0)
+        env.storage().instance().get(&DataKey::Balance).unwrap_or(0)
     }
 
     /// Get the treasury configuration.
@@ -1064,11 +1307,7 @@ impl TreasuryContract {
             .instance()
             .get(&DataKey::Signers)
             .unwrap_or(Vec::new(&env));
-        let balance: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance)
-            .unwrap_or(0);
+        let balance: i128 = env.storage().instance().get(&DataKey::Balance).unwrap_or(0);
         let tx_count: u64 = env
             .storage()
             .instance()
@@ -1107,12 +1346,30 @@ impl TreasuryContract {
             .unwrap_or(Vec::new(&env))
     }
 
+    /// Return the current emergency pause state. This read remains available
+    /// while paused so operators and indexers can verify recovery progress.
+    pub fn get_pause_state(env: Env) -> PauseState {
+        Self::pause_state(&env)
+    }
+
+    /// Return a pause request and its signer approvals for audit purposes.
+    pub fn get_pause_request(env: Env, request_id: u64) -> Result<PauseRequest, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PauseRequest(request_id))
+            .ok_or(Error::PauseRequestNotFound)
+    }
+
     // ========================================================================
     // Admin Functions
     // ========================================================================
 
     /// Transfer admin role to a new address.
-    pub fn transfer_admin(env: Env, current_admin: Address, new_admin: Address) -> Result<(), Error> {
+    pub fn transfer_admin(
+        env: Env,
+        current_admin: Address,
+        new_admin: Address,
+    ) -> Result<(), Error> {
         Self::require_initialized(&env)?;
         Self::require_admin(&env, &current_admin)?;
 
@@ -1120,9 +1377,7 @@ impl TreasuryContract {
 
         Self::require_acl_admin_or_above(&env, &new_admin)?;
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Admin, &new_admin);
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
 
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("admin")),
@@ -1133,7 +1388,11 @@ impl TreasuryContract {
     }
 
     /// Upgrade the contract WASM. Admin only.
-    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), Error> {
+    pub fn upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), Error> {
         Self::require_initialized(&env)?;
         Self::require_admin(&env, &admin)?;
 
@@ -1150,6 +1409,42 @@ impl TreasuryContract {
     fn require_initialized(env: &Env) -> Result<(), Error> {
         if !env.storage().instance().has(&DataKey::Initialized) {
             return Err(Error::NotInitialized);
+        }
+        Ok(())
+    }
+
+    fn pause_state(env: &Env) -> PauseState {
+        env.storage()
+            .instance()
+            .get(&DataKey::PauseState)
+            .unwrap_or(PauseState {
+                paused: false,
+                version: 0,
+            })
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), Error> {
+        if Self::pause_state(env).paused {
+            return Err(Error::TreasuryPaused);
+        }
+        Ok(())
+    }
+
+    fn validate_pause_request(env: &Env, request: &PauseRequest) -> Result<(), Error> {
+        if request.executed {
+            return Err(Error::PauseRequestExecuted);
+        }
+        if request.policy_version
+            != env
+                .storage()
+                .instance()
+                .get(&DataKey::PolicyVersion)
+                .unwrap_or(1)
+        {
+            return Err(Error::PolicyInvalidated);
+        }
+        if request.paused == Self::pause_state(env).paused {
+            return Err(Error::InvalidPauseTransition);
         }
         Ok(())
     }
@@ -1218,14 +1513,12 @@ impl TreasuryContract {
 
 #[cfg(test)]
 mod test {
-    use soroban_sdk::testutils::Events;
-    use soroban_sdk::testutils::Ledger as _;
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::testutils::Ledger as _;
     use soroban_sdk::Env;
-    use stellar_sentinel_access_control::{
-        AccessControlContract, AccessControlContractClient,
-    };
+    use stellar_sentinel_access_control::{AccessControlContract, AccessControlContractClient};
 
     fn deploy_acl(env: &Env, owner: &Address) -> Address {
         let acl_id = env.register_contract(None, AccessControlContract);
@@ -1246,7 +1539,14 @@ mod test {
 
     fn setup_contract_with_token(
         init_balance: i128,
-    ) -> (Env, Address, Address, TreasuryContractClient<'static>, soroban_sdk::Address, token::StellarAssetClient<'static>) {
+    ) -> (
+        Env,
+        Address,
+        Address,
+        TreasuryContractClient<'static>,
+        soroban_sdk::Address,
+        token::StellarAssetClient<'static>,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
@@ -1272,10 +1572,7 @@ mod test {
 
         let asset = Address::generate(&env);
 
-        let signers = Vec::from_array(
-            &env,
-            [signer1.clone(), signer2.clone(), signer3.clone()],
-        );
+        let signers = Vec::from_array(&env, [signer1.clone(), signer2.clone(), signer3.clone()]);
 
         client.initialize(&admin, &asset, &2, &signers, &acl_id);
 
@@ -1348,7 +1645,7 @@ mod test {
         let signer1 = Address::generate(&env);
         let asset = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone(), signer1.clone()]);
-        
+
         client.initialize(&admin, &asset, &1, &signers, &acl_id);
     }
 
@@ -1359,7 +1656,7 @@ mod test {
         let signer1 = Address::generate(&env);
         let asset = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
-        
+
         client.initialize(&admin, &asset, &1, &signers, &acl_id);
         // Attempt re-initialization
         let new_asset = Address::generate(&env);
@@ -1373,7 +1670,7 @@ mod test {
         let signer1 = Address::generate(&env);
         let asset = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
-        
+
         client.initialize(&admin, &asset, &0, &signers, &acl_id);
     }
 
@@ -1384,7 +1681,7 @@ mod test {
         let signer1 = Address::generate(&env);
         let asset = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
-        
+
         client.initialize(&admin, &asset, &2, &signers, &acl_id);
     }
 
@@ -1415,7 +1712,8 @@ mod test {
         assert_eq!(client.get_balance(), 1_500);
 
         let recipient = Address::generate(&env);
-        let tx_id = client.propose_withdrawal(&signer1, &recipient, &500, &symbol_short!("pay"), &2000);
+        let tx_id =
+            client.propose_withdrawal(&signer1, &recipient, &500, &symbol_short!("pay"), &2000);
         client.execute(&signer1, &tx_id);
 
         assert_eq!(client.get_balance(), 1_000);
@@ -1439,7 +1737,7 @@ mod test {
         let (env, admin, acl_id, client, asset, sac_client) = setup_contract_with_token(500);
         let signer1 = Address::generate(&env);
         let signers = Vec::from_array(&env, [signer1.clone()]);
-        
+
         let events_before_init = env.events().all().len();
         client.initialize(&admin, &asset, &1, &signers, &acl_id);
         let events_after_init = env.events().all().len();
@@ -1450,9 +1748,10 @@ mod test {
         client.deposit(&depositor, &500);
         let events_after_deposit = env.events().all().len();
         assert!(events_after_deposit > events_after_init);
-        
+
         let recipient = Address::generate(&env);
-        let tx_id = client.propose_withdrawal(&signer1, &recipient, &500, &symbol_short!("pay"), &2000);
+        let tx_id =
+            client.propose_withdrawal(&signer1, &recipient, &500, &symbol_short!("pay"), &2000);
         let events_after_propose = env.events().all().len();
         assert!(events_after_propose > events_after_deposit);
 
@@ -1517,7 +1816,10 @@ mod test {
         let recipient_balance_after: i128 = token_client.balance(&recipient);
         let contract_balance_after: i128 = token_client.balance(&contract_id);
 
-        assert_eq!(recipient_balance_after, recipient_balance_before + 2_000_000);
+        assert_eq!(
+            recipient_balance_after,
+            recipient_balance_before + 2_000_000
+        );
         assert_eq!(contract_balance_after, contract_balance_before - 2_000_000);
         assert_eq!(client.get_balance(), 3_000_000);
 
@@ -1690,7 +1992,6 @@ mod test {
 
         let sac_client = token::StellarAssetClient::new(&env, &asset);
 
-
         sac_client.mint(&signer1, &1_000_000);
         client.deposit(&signer1, &1_000_000);
 
@@ -1719,13 +2020,118 @@ mod test {
         assert_eq!(recipient_balance_after, recipient_balance_before);
     }
 
+    #[test]
+    fn test_threshold_pause_blocks_withdrawals_and_threshold_unpause_recovers() {
+        let (env, admin, acl_id, client, asset, sac_client) = setup_contract_with_token(0);
+        let signer1 = Address::generate(&env);
+        let signer2 = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let signers = Vec::from_array(&env, [signer1.clone(), signer2.clone()]);
+        client.initialize(&admin, &asset, &2, &signers, &acl_id);
+
+        sac_client.mint(&signer1, &1_000_000);
+        client.deposit(&signer1, &1_000_000);
+        let withdrawal = client.propose_withdrawal(
+            &signer1,
+            &recipient,
+            &500_000,
+            &symbol_short!("pause"),
+            &(env.ledger().timestamp() + 3600),
+        );
+
+        let pause_id = client.propose_pause(&signer1, &true);
+        // A proposer alone cannot change emergency state.
+        assert_eq!(
+            client.try_execute_pause(&signer1, &pause_id),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert!(!client.get_pause_state().paused);
+
+        client.approve_pause(&signer2, &pause_id);
+        client.execute_pause(&signer1, &pause_id);
+        assert_eq!(
+            client.get_pause_state(),
+            PauseState {
+                paused: true,
+                version: 1
+            }
+        );
+
+        // New proposals, approvals, and execution fail before mutating state.
+        assert_eq!(
+            client.try_propose_withdrawal(
+                &signer1,
+                &recipient,
+                &1,
+                &symbol_short!("new"),
+                &(env.ledger().timestamp() + 3600),
+            ),
+            Err(Ok(Error::TreasuryPaused))
+        );
+        assert_eq!(
+            client.try_approve(&signer2, &withdrawal),
+            Err(Ok(Error::TreasuryPaused))
+        );
+        assert_eq!(
+            client.try_execute(&signer1, &withdrawal),
+            Err(Ok(Error::TreasuryPaused))
+        );
+        assert_eq!(client.get_balance(), 1_000_000);
+        assert!(!client.get_transaction(&withdrawal).executed);
+
+        // Reads and the governed recovery flow remain available while paused.
+        let unpause_id = client.propose_pause(&signer1, &false);
+        client.approve_pause(&signer2, &unpause_id);
+        client.execute_pause(&signer2, &unpause_id);
+        assert_eq!(
+            client.get_pause_state(),
+            PauseState {
+                paused: false,
+                version: 2
+            }
+        );
+
+        client.approve(&signer2, &withdrawal);
+        client.execute(&signer1, &withdrawal);
+        assert_eq!(client.get_balance(), 500_000);
+        assert_eq!(
+            client.try_execute_pause(&signer1, &unpause_id),
+            Err(Ok(Error::PauseRequestExecuted))
+        );
+    }
+
+    #[test]
+    fn test_pause_request_is_invalidated_by_policy_change() {
+        let (env, admin, acl_id, client, asset, _sac_client) = setup_contract_with_token(0);
+        let signer1 = Address::generate(&env);
+        let signer2 = Address::generate(&env);
+        let signers = Vec::from_array(&env, [signer1.clone(), signer2.clone()]);
+        client.initialize(&admin, &asset, &2, &signers, &acl_id);
+
+        let pause_id = client.propose_pause(&signer1, &true);
+        client.set_threshold(&admin, &1);
+        assert_eq!(
+            client.try_approve_pause(&signer2, &pause_id),
+            Err(Ok(Error::PolicyInvalidated))
+        );
+        assert!(!client.get_pause_state().paused);
+    }
+
     // ========================================================================
     // Governance-authorized withdrawal
     // ========================================================================
 
     fn setup_governance_treasury(
         init_balance: i128,
-    ) -> (Env, Address, Address, TreasuryContractClient<'static>, Address, Address, token::StellarAssetClient<'static>) {
+    ) -> (
+        Env,
+        Address,
+        Address,
+        TreasuryContractClient<'static>,
+        Address,
+        Address,
+        token::StellarAssetClient<'static>,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -1750,7 +2156,15 @@ mod test {
         let governance = Address::generate(&env);
         client.set_governance(&admin, &governance);
 
-        (env, admin, acl_id, client, contract_id, governance, sac_client)
+        (
+            env,
+            admin,
+            acl_id,
+            client,
+            contract_id,
+            governance,
+            sac_client,
+        )
     }
 
     #[test]
@@ -1766,16 +2180,53 @@ mod test {
         let recipient_before = token_client.balance(&recipient);
 
         client.execute_governance_withdrawal(
-            &governance, &contract_id, &1, &recipient, &asset,
-            &2_000_000, &policy_version, &expires_at,
+            &governance,
+            &contract_id,
+            &1,
+            &recipient,
+            &asset,
+            &2_000_000,
+            &policy_version,
+            &expires_at,
         );
 
-        assert_eq!(token_client.balance(&recipient), recipient_before + 2_000_000);
+        assert_eq!(
+            token_client.balance(&recipient),
+            recipient_before + 2_000_000
+        );
         assert_eq!(client.get_balance(), 3_000_000);
 
         let receipt = client.get_governance_withdrawal(&governance, &1).unwrap();
         assert_eq!(receipt.amount, 2_000_000);
         assert_eq!(receipt.to, recipient);
+    }
+
+    #[test]
+    fn test_pause_blocks_governance_authorized_withdrawals() {
+        let (env, _admin, _acl_id, client, contract_id, governance, _sac) =
+            setup_governance_treasury(5_000_000);
+        let signer = client.get_signers().get(0).unwrap();
+        let pause_id = client.propose_pause(&signer, &true);
+        client.execute_pause(&signer, &pause_id);
+
+        let recipient = Address::generate(&env);
+        let asset = client.get_config().asset;
+        let policy_version = client.get_config().policy_version;
+        let expires_at = env.ledger().timestamp() + 3600;
+        assert_eq!(
+            client.try_execute_governance_withdrawal(
+                &governance,
+                &contract_id,
+                &1,
+                &recipient,
+                &asset,
+                &2_000_000,
+                &policy_version,
+                &expires_at,
+            ),
+            Err(Ok(Error::TreasuryPaused))
+        );
+        assert_eq!(client.get_balance(), 5_000_000);
     }
 
     #[test]
@@ -1788,15 +2239,27 @@ mod test {
         let expires_at = env.ledger().timestamp() + 3600;
 
         client.execute_governance_withdrawal(
-            &governance, &contract_id, &1, &recipient, &asset,
-            &2_000_000, &policy_version, &expires_at,
+            &governance,
+            &contract_id,
+            &1,
+            &recipient,
+            &asset,
+            &2_000_000,
+            &policy_version,
+            &expires_at,
         );
 
         // Same proposal_id replayed — even with identical parameters — must fail.
         assert_eq!(
             client.try_execute_governance_withdrawal(
-                &governance, &contract_id, &1, &recipient, &asset,
-                &2_000_000, &policy_version, &expires_at,
+                &governance,
+                &contract_id,
+                &1,
+                &recipient,
+                &asset,
+                &2_000_000,
+                &policy_version,
+                &expires_at,
             ),
             Err(Ok(Error::AuthorizationReplayed))
         );
@@ -1815,8 +2278,14 @@ mod test {
         let impostor = Address::generate(&env);
         assert_eq!(
             client.try_execute_governance_withdrawal(
-                &impostor, &contract_id, &1, &recipient, &asset,
-                &2_000_000, &policy_version, &expires_at,
+                &impostor,
+                &contract_id,
+                &1,
+                &recipient,
+                &asset,
+                &2_000_000,
+                &policy_version,
+                &expires_at,
             ),
             Err(Ok(Error::GovernanceUnauthorized))
         );
@@ -1835,8 +2304,14 @@ mod test {
         let wrong_treasury = Address::generate(&env);
         assert_eq!(
             client.try_execute_governance_withdrawal(
-                &governance, &wrong_treasury, &1, &recipient, &asset,
-                &2_000_000, &policy_version, &expires_at,
+                &governance,
+                &wrong_treasury,
+                &1,
+                &recipient,
+                &asset,
+                &2_000_000,
+                &policy_version,
+                &expires_at,
             ),
             Err(Ok(Error::TreasuryMismatch))
         );
@@ -1854,8 +2329,14 @@ mod test {
         let wrong_asset = Address::generate(&env);
         assert_eq!(
             client.try_execute_governance_withdrawal(
-                &governance, &contract_id, &1, &recipient, &wrong_asset,
-                &2_000_000, &policy_version, &expires_at,
+                &governance,
+                &contract_id,
+                &1,
+                &recipient,
+                &wrong_asset,
+                &2_000_000,
+                &policy_version,
+                &expires_at,
             ),
             Err(Ok(Error::AssetMismatch))
         );
@@ -1875,8 +2356,14 @@ mod test {
 
         assert_eq!(
             client.try_execute_governance_withdrawal(
-                &governance, &contract_id, &1, &recipient, &asset,
-                &2_000_000, &policy_version, &expires_at,
+                &governance,
+                &contract_id,
+                &1,
+                &recipient,
+                &asset,
+                &2_000_000,
+                &policy_version,
+                &expires_at,
             ),
             Err(Ok(Error::AuthorizationExpired))
         );
@@ -1898,8 +2385,14 @@ mod test {
 
         assert_eq!(
             client.try_execute_governance_withdrawal(
-                &governance, &contract_id, &1, &recipient, &asset,
-                &2_000_000, &stale_policy_version, &expires_at,
+                &governance,
+                &contract_id,
+                &1,
+                &recipient,
+                &asset,
+                &2_000_000,
+                &stale_policy_version,
+                &expires_at,
             ),
             Err(Ok(Error::PolicyInvalidated))
         );
@@ -1919,8 +2412,14 @@ mod test {
         // without marking the (governance, proposal_id) pair as executed.
         assert_eq!(
             client.try_execute_governance_withdrawal(
-                &governance, &contract_id, &1, &recipient, &asset,
-                &2_000_000, &policy_version, &expires_at,
+                &governance,
+                &contract_id,
+                &1,
+                &recipient,
+                &asset,
+                &2_000_000,
+                &policy_version,
+                &expires_at,
             ),
             Err(Ok(Error::InsufficientFunds))
         );
@@ -1929,8 +2428,14 @@ mod test {
 
         // A smaller, satisfiable amount for the same proposal_id now succeeds.
         client.execute_governance_withdrawal(
-            &governance, &contract_id, &1, &recipient, &asset,
-            &500_000, &policy_version, &expires_at,
+            &governance,
+            &contract_id,
+            &1,
+            &recipient,
+            &asset,
+            &500_000,
+            &policy_version,
+            &expires_at,
         );
         assert_eq!(client.get_balance(), 500_000);
     }
