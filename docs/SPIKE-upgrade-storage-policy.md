@@ -36,8 +36,8 @@ the honest rollback story if an upgrade goes wrong.
 - It swaps the WASM code hash the contract's on-chain **instance** points to, in the same
   transaction/invocation that calls it. The contract address, and every existing `Instance`,
   `Persistent`, and `Temporary` storage entry under that address, is untouched by the call itself
-  — only the code that will interpret those bytes on the *next* invocation changes.
-  the transaction succeeds. No canary, no dual-run, no automatic drain/pause.
+  — only the code that will interpret those bytes on the *next* invocation changes, effective as
+  soon as the transaction succeeds. No canary, no dual-run, no automatic drain/pause.
 - The **old WASM is not deleted.** Soroban keeps uploaded contract code keyed by its hash
   (`ContractCodeEntry`) independently of which contract instance references it. As long as the
   old hash is still known and still resolvable on the target network (subject to that network's
@@ -47,24 +47,39 @@ the honest rollback story if an upgrade goes wrong.
   the old and new WASM's storage schema for you — that responsibility is entirely on the
   contract author and the upgrade process.
 
-## 3. Storage-layout risk: why this is a real Soroban footgun
+## 3. Storage-layout risk: what actually breaks Soroban storage keys
 
-`soroban-sdk`'s `#[contracttype] enum DataKey { A, B, C }` derives each variant's storage-key
-discriminant from **declaration order**, not from the variant name. Reordering, inserting a
-variant in the middle, or deleting one shifts every discriminant after it — the new WASM will
-read/write a *different* ledger storage key than the old WASM did for what looks like "the same"
-field, silently, with no error at the call site. **Appending new variants at the end of the enum
-is safe** (existing discriminants are unchanged); anything else is not.
+> Corrected after maintainer review of the first draft, which incorrectly claimed `DataKey`
+> storage keys are declaration-order discriminants. Verified directly against
+> `soroban-sdk-macros` v21.7.7's `#[contracttype]` derive (`derive_enum.rs`, `derive_struct.rs`,
+> vendored at `~/.cargo/registry/src/.../soroban-sdk-macros-21.7.7/src/`).
 
-The same risk applies one level deeper to any `#[contracttype] struct` used as a stored value
-(e.g. `TreasuryConfig`, `Transaction`, `Proposal`, `TokenLock`, `VestingSchedule`,
-`RoleAssignment`): adding a field changes the struct's XDR encoding, and an old-format value
-already on ledger will fail to decode (or worse, decode into the wrong field) unless the new
-code tolerates the old shape or a migration pass rewrites existing entries.
+- **Enum variants** (`DataKey`, `ProposalAction`, `ProposalStatus`, …): a unit variant encodes as
+  `ScVal::Symbol(<variant name>)`; a tuple variant (e.g. `DataKey::Transaction(u64)`) encodes as a
+  vec whose first element is that same `Symbol` followed by its fields
+  (`(Symbol("Transaction"), u64)`). The storage key is the variant's **name string**, not its
+  position in the source. **Reordering variants, or inserting a new one anywhere in the
+  declaration, is safe** — no existing key changes. **Renaming a variant, or removing one that
+  still has live storage under it, is the real breaking change**: the old symbol's data becomes
+  unreachable, and if the name is reused for a different variant, misinterpreted.
+- **Struct fields** (`TreasuryConfig`, `Transaction`, `Proposal`, `TokenLock`, `VestingSchedule`,
+  `RoleAssignment`, …): `#[contracttype] struct` values encode as an `ScMap` **sorted by field
+  name** and keyed by `ScSymbol(<field name>)`. Declaration order is irrelevant for the same
+  reason as enums. **Renaming a field** breaks decoding of existing entries (the old key is gone).
+  **Removing a field** silently orphans the value already on ledger. **Adding a field** is
+  additive at the Rust-type level, but soroban-sdk's derived `TryFromVal` for `#[contracttype]`
+  structs requires every declared field to be present in the map — so in practice **adding a
+  required field still breaks decoding of previously-stored entries** unless paired with a
+  migration that backfills the new key, not just an additive Rust change.
+- Within one tuple variant/tuple struct, the field **types and count are still positional** —
+  changing a tuple field's type or inserting one in the middle of an existing tuple variant
+  changes what that variant decodes to, same as any binary format.
 
-None of the four contracts currently has an automated check for this. `cargo build`/`cargo test`
-will happily compile a WASM that reorders a `DataKey` variant — Rust's type system does not know
-that the *positional* discriminant is load-bearing on-chain state.
+So the real compatibility contract is **name- and shape-stability of every variant and field that
+already has live data** — not declaration order. None of the four contracts currently has an
+automated check for this: `cargo build`/`cargo test` will happily compile a WASM that renames or
+drops a `DataKey` variant or a stored struct's field; Rust's type system has no notion that a
+variant/field *name* is load-bearing on-chain state.
 
 ## 4. Version/storage compatibility matrix
 
@@ -90,10 +105,10 @@ privileged path depends on it staying storage-compatible, and it upgrades on the
   with the previous WASM hash reverts *behavior* if that hash is still resolvable. It does
   **not** revert any storage writes the bad version made while it was live — deposits, approvals,
   executed withdrawals, role changes, and any storage-key/struct-shape change it introduced stay
-  exactly as written. If the bad version wrote under new/shifted `DataKey` discriminants, the old
-  code may not even be able to read what the bad version wrote.
-- **A storage-incompatible upgrade is not recoverable by rollback alone.** If new code reorders a
-  `DataKey` variant or changes a stored struct's field set and processes even one write before
+  exactly as written. If the bad version wrote under a renamed or reshaped `DataKey` variant or
+  struct field (§3), the old code may not even be able to read what the bad version wrote.
+- **A storage-incompatible upgrade is not recoverable by rollback alone.** If new code renames or
+  drops a `DataKey` variant or a stored struct's field (§3) and processes even one write before
   the problem is caught, rolling the code back does not un-corrupt that entry — a migration or
   manual remediation is required, and for funds-custody state (treasury balance, executed
   transactions, vesting `claimed_amount`) there may be no way to reconstruct the correct value
@@ -161,22 +176,24 @@ for security patches.** Concretely:
    must still require more than one key, never fewer.
 5. **Storage-compatibility is a process control, not a runtime one.** Soroban cannot check this
    for us (§3), so it must be enforced before code ever reaches `propose_upgrade`:
-   - `DataKey`-style enums: new variants only ever appended at the end; PR review must reject
-     any diff that reorders, renames-in-place, or removes a variant. A regression test that
-     snapshots each contract's `DataKey` variant order (fails the build if the order changes)
-     turns this from a review nit into an enforced CI check — see the implementation issues.
-   - Stored structs: additive-only field changes, or an explicit migration function that reads
-     the old encoding and rewrites it before the new code path can rely on the new field being
-     present.
+   - `DataKey`-style enums and stored structs alike: variant/field **names are the storage key**,
+     so reordering or inserting is safe, but PR review must reject any diff that renames or
+     removes a variant/field with live on-chain data, and must require a migration whenever a
+     struct gains a field that existing stored entries won't have (the derived decode requires
+     every field present, so a new required field breaks old entries without one).
+   - A regression test that snapshots each contract's `DataKey` variant **names** and each stored
+     struct's field **names and types** (failing the build on a rename/removal, not on
+     reordering) turns this from a review nit into an enforced CI check — tracked in #88.
 6. **Testnet dry-run is a release gate, not optional.** See the checklist below.
 
 ### Non-negotiable release checks (must all pass before any upgrade is authorized)
 
-- [ ] The new WASM's `DataKey` enum for the target contract is a strict prefix-or-superset (by
-      declared order) of the currently-deployed enum — no reordering, no removed variants.
-- [ ] Every stored struct type is either unchanged or changed additively; any non-additive change
-      ships with a migration function and a test that exercises it against a pre-upgrade-shaped
-      fixture.
+- [ ] Every `DataKey` variant name, and every stored struct's field name and type, that has live
+      on-chain data in the currently-deployed WASM is still present and unrenamed in the new WASM
+      (reordering variants/fields is fine; renaming or removing one that has live data is not).
+- [ ] Any struct gaining a field ships with a migration function and a test that exercises it
+      against a pre-upgrade-shaped fixture, since existing entries won't decode with the new
+      field simply declared additively.
 - [ ] `cargo test --all` and the cross-contract invariant suite
       (`cargo test -p stellar-sentinel-integration-tests`) pass against the new WASM.
 - [ ] The upgrade has been deployed and exercised on testnet: propose → approve × threshold →
@@ -192,31 +209,37 @@ for security patches.** Concretely:
 
 ## 9. Sequenced implementation issues
 
-Filed in dependency order — later items build on the propose/approve/execute plumbing the
-earlier ones introduce. Not auto-filed as GitHub issues so maintainers can pick the exact
-authorization shape (threshold values, delay lengths) before implementation starts.
+Filed as tracked GitHub issues, in dependency order — later items build on the propose/approve/
+execute plumbing the earlier ones introduce. Exact authorization shape (threshold values, delay
+lengths) is left as an open decision on each issue for maintainers to pick before implementation
+starts.
 
-1. **Add a `DataKey`-order regression test per contract** (CI gate): a test that asserts each
-   contract's `DataKey` enum serializes to the same discriminant sequence as a checked-in
-   snapshot, failing the build on any reorder/removal. Ships independently of everything else
-   below and closes the biggest silent-corruption gap immediately.
-2. **Governed, threshold-gated, time-delayed upgrade for `treasury`** —
+1. [**#88 — Add a storage-compatibility regression test per contract**](https://github.com/Stellar-Re-Code/StellarSentinel/issues/88)
+   (CI gate): snapshots each contract's `DataKey` variant **names** and each stored struct's
+   field **names and types**, failing the build on a rename/removal (not on reordering — see
+   §3). Ships independently of everything else below and closes the real silent-corruption gap.
+2. [**#89 — Governed, threshold-gated, time-delayed upgrade for `treasury`**](https://github.com/Stellar-Re-Code/StellarSentinel/issues/89) —
    `propose_upgrade`/`approve_upgrade`/`execute_upgrade`, reusing the signer/threshold storage
    already in `DataKey::Signers`/`DataKey::Threshold`, modeled on `PauseState`/`PauseRequest`.
    Includes `(treasury, up_prop|up_ap|up_exec)` events and policy-version invalidation of stale
-   pending upgrades.
-3. **Same for `governance` and `token-vault`**, reusing their existing signer/member sets.
-4. **Owner + fixed-delay upgrade for `access-control`.** Given it has no signer threshold, this
-   is a smaller propose/wait/execute flow gated on `Owner` alone, plus the same event trail.
-5. **Emergency (expedited) upgrade path policy issue** — a dedicated issue to decide and
-   implement the supermajority-waives-delay mechanism referenced in §8.4, kept deliberately
-   separate so the normal path isn't compromised by rushing the emergency one.
-6. **Testnet dry-run tooling and runbook**: scripts under `smartcontract/` (or a `deploy/`
-   directory, none exists today) to drive the full propose/approve/wait/execute sequence against
-   testnet and capture the evidence listed in the release checklist, plus a runbook doc
-   analogous to `TREASURY_EMERGENCY_PAUSE.md`'s recovery procedure.
-7. **Document the upgrade event schema** in `SMARTCONTRACT_GUIDE.md`'s Event Reference, matching
-   the existing per-contract table format, once (2) through (4) land.
+   pending upgrades. Depends on #88.
+3. [**#90 — Same for `governance` and `token-vault`**](https://github.com/Stellar-Re-Code/StellarSentinel/issues/90),
+   reusing their existing member/emergency-signer sets. Depends on #88, follows #89's shape.
+4. [**#91 — Owner + fixed-delay upgrade for `access-control`**](https://github.com/Stellar-Re-Code/StellarSentinel/issues/91).
+   Given it has no signer threshold, this is a smaller propose/wait/execute flow gated on `Owner`
+   alone, plus the same event trail. Depends on #88.
+5. [**#92 — Emergency (expedited) upgrade path**](https://github.com/Stellar-Re-Code/StellarSentinel/issues/92) —
+   a dedicated issue to decide and implement the supermajority-waives-delay mechanism referenced
+   in §8.4, kept deliberately separate so the normal path isn't compromised by rushing the
+   emergency one. Depends on #89, #90, #91.
+6. [**#93 — Testnet dry-run tooling and runbook**](https://github.com/Stellar-Re-Code/StellarSentinel/issues/93):
+   builds on the existing #78 (reproducible testnet deployment manifest and smoke suite) by
+   driving the full propose/approve/wait/execute sequence against testnet and capturing the
+   evidence listed in the release checklist, plus a runbook doc analogous to
+   `TREASURY_EMERGENCY_PAUSE.md`'s recovery procedure. Depends on #78, #89, #90, #91.
+7. [**#94 — Document the upgrade event schema**](https://github.com/Stellar-Re-Code/StellarSentinel/issues/94)
+   in `SMARTCONTRACT_GUIDE.md`'s Event Reference, matching the existing per-contract table
+   format, once #89/#90/#91 land.
 
 ## 10. Out of scope (per issue #83)
 
