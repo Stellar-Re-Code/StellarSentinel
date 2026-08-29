@@ -1,4 +1,4 @@
-import { SorobanRpc } from '@stellar/stellar-sdk';
+import { SorobanRpc, xdr, scValToNative, Address } from '@stellar/stellar-sdk';
 import type { Db } from '../db/client';
 import type { Config } from '../config';
 import { contractIdMap } from '../config';
@@ -34,6 +34,10 @@ export class Indexer {
         rpcUrl: config.sorobanRpcUrl,
         networkPassphrase: config.networkPassphrase,
         treasuryContractId: config.contracts.treasury,
+        onChainProposalStatuses: () => this.fetchOnChainProposalStatuses(config.contracts.treasury!),
+        onChainVaultRemainings: config.contracts.vault
+          ? () => this.fetchOnChainVaultRemainings(config.contracts.vault!)
+          : undefined,
       });
     }
 
@@ -222,6 +226,126 @@ export class Indexer {
       case 'vault':      return handleVaultEvent(this.db, event);
       case 'acl':        return handleAclEvent(this.db, event);
     }
+  }
+
+  /**
+   * RPC-backed getter: read proposal statuses from the on-chain treasury
+   * contract storage so the Reconciler can verify indexed state.
+   */
+  private async fetchOnChainProposalStatuses(
+    treasuryContractId: string,
+  ): Promise<Array<{ proposalId: string; status: string }>> {
+    const txCounterKey = xdr.LedgerKey.contractData(
+      new xdr.LedgerKeyContractData({
+        contract: new Address(treasuryContractId).toScAddress(),
+        key: xdr.ScVal.scvVec([
+          xdr.ScVal.scvSymbol('Transaction'),
+          xdr.ScVal.scvU32(0),
+        ]),
+        durability: xdr.ContractDataDurability.persistent(),
+      }),
+    );
+
+    // Read TxCounter to learn how many proposals exist.
+    const counterKey = xdr.LedgerKey.contractData(
+      new xdr.LedgerKeyContractData({
+        contract: new Address(treasuryContractId).toScAddress(),
+        key: xdr.ScVal.scvSymbol('TxCounter'),
+        durability: xdr.ContractDataDurability.persistent(),
+      }),
+    );
+
+    const resp = await this.server.getLedgerEntries(counterKey);
+    if (resp.entries.length === 0) return [];
+
+    const counterVal = scValToNative(resp.entries[0].val.contractData().val());
+    const txCount = typeof counterVal === 'bigint' ? Number(counterVal) : Number(counterVal);
+
+    const results: Array<{ proposalId: string; status: string }> = [];
+    // Batch-read proposals (limit to 200 to avoid huge RPC payloads).
+    const batchSize = 50;
+    for (let start = 1; start <= txCount && start <= 200; start += batchSize) {
+      const keys: xdr.LedgerKey[] = [];
+      const ids: number[] = [];
+      for (let i = start; i < Math.min(start + batchSize, txCount + 1) && i <= 200; i++) {
+        keys.push(
+          xdr.LedgerKey.contractData(
+            new xdr.LedgerKeyContractData({
+              contract: new Address(treasuryContractId).toScAddress(),
+              key: xdr.ScVal.scvVec([
+                xdr.ScVal.scvSymbol('Transaction'),
+                xdr.ScVal.scvU32(i),
+              ]),
+              durability: xdr.ContractDataDurability.persistent(),
+            }),
+          ),
+        );
+        ids.push(i);
+      }
+
+      const batch = await this.server.getLedgerEntries(...keys);
+      for (let j = 0; j < batch.entries.length; j++) {
+        const entry = batch.entries[j];
+        const val = scValToNative(entry.val.contractData().val()) as Record<string, unknown>;
+        const executed = val.executed === true || val.executed === 1;
+        const canceled = val.canceled === true || val.canceled === 1;
+        const status = canceled ? 'canceled' : executed ? 'executed' : 'proposed';
+        results.push({ proposalId: String(ids[j]), status });
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * RPC-backed getter: read vault remaining amounts from the on-chain vault
+   * contract storage so the Reconciler can verify indexed derived state.
+   */
+  private async fetchOnChainVaultRemainings(
+    vaultContractId: string,
+  ): Promise<Array<{ vaultId: string; remaining: string }>> {
+    // Read the vault's persistent storage for locked/remaining amounts.
+    // The vault contract stores DataKey::Locked(vault_id) as i128.
+    // We scan the DB for known vault IDs and read each from chain.
+    const vaultSchedules = this.db.getVaultSchedules(vaultContractId);
+    if (vaultSchedules.length === 0) return [];
+
+    const results: Array<{ vaultId: string; remaining: string }> = [];
+    const batchSize = 20;
+    for (let i = 0; i < vaultSchedules.length; i += batchSize) {
+      const batch = vaultSchedules.slice(i, i + batchSize);
+      const keys: xdr.LedgerKey[] = [];
+      for (const v of batch) {
+        keys.push(
+          xdr.LedgerKey.contractData(
+            new xdr.LedgerKeyContractData({
+              contract: new Address(vaultContractId).toScAddress(),
+              key: xdr.ScVal.scvVec([
+                xdr.ScVal.scvSymbol('Locked'),
+                xdr.ScVal.scvString(v.vault_id),
+              ]),
+              durability: xdr.ContractDataDurability.persistent(),
+            }),
+          ),
+        );
+      }
+
+      try {
+        const resp = await this.server.getLedgerEntries(...keys);
+        for (let j = 0; j < resp.entries.length; j++) {
+          const val = scValToNative(resp.entries[j].val.contractData().val());
+          results.push({
+            vaultId: batch[j].vault_id,
+            remaining: String(val as bigint),
+          });
+        }
+      } catch {
+        // Vault contract may not be deployed or may have different storage
+        // layout — skip this batch and let reconciliation report missing data.
+      }
+    }
+
+    return results;
   }
 }
 
