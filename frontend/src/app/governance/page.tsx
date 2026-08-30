@@ -1,4 +1,11 @@
+"use client";
+
+import { ProposalCard } from "@/components/ProposalCard";
+import { useGovernance } from "@/hooks/useGovernance";
+
 export default function GovernancePage() {
+  const { proposals, hasMore, loading, loadingMore, error, refresh, loadMore } = useGovernance();
+
   return (
     <div className="space-y-8">
       <div className="flex justify-between items-center">
@@ -32,20 +39,39 @@ export default function GovernancePage() {
         </div>
       </div>
 
-      {/* Proposal List */}
-      {/* TODO: [FE-13] Implement proposal list with real data */}
       {/* TODO: [FE-16] Add vote casting UI */}
       <div>
         <h2 className="text-xl font-semibold text-white mb-4">
           Active Proposals
         </h2>
         <div className="space-y-4">
-          {/* Placeholder Proposal Card */}
-          <div className="card">
-            <p className="text-gray-500 text-center py-8">
-              Connect your wallet to view proposals
-            </p>
-          </div>
+          {loading && <div className="card text-center py-8 text-gray-500">Loading proposals...</div>}
+          {error && (
+            <div className="card text-center py-8 text-red-400">
+              <p>{error}</p>
+              <button className="btn-primary mt-4" onClick={() => void refresh()}>Retry</button>
+            </div>
+          )}
+          {!loading && !error && proposals.length === 0 && (
+            <div className="card text-center py-8 text-gray-500">No proposals found.</div>
+          )}
+          {proposals.map((proposal) => (
+            <ProposalCard
+              key={proposal.id}
+              id={proposal.id}
+              title={proposal.title}
+              description={proposal.description}
+              status={proposal.status}
+              votesFor={proposal.votesFor}
+              votesAgainst={proposal.votesAgainst}
+              proposer={proposal.proposer}
+            />
+          ))}
+          {!loading && !error && hasMore && (
+            <button className="btn-secondary w-full" onClick={() => void loadMore()} disabled={loadingMore}>
+              {loadingMore ? "Loading proposals..." : "Load more proposals"}
+            </button>
+          )}
         </div>
       </div>
 
