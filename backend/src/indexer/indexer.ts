@@ -235,31 +235,37 @@ export class Indexer {
   private async fetchOnChainProposalStatuses(
     treasuryContractId: string,
   ): Promise<Array<{ proposalId: string; status: string }>> {
-    const txCounterKey = xdr.LedgerKey.contractData(
+    // TxCounter lives in contract instance storage (not a standalone persistent key).
+    // Read the full contract instance and extract TxCounter from its storage map.
+    const contractKey = xdr.LedgerKey.contractData(
       new xdr.LedgerKeyContractData({
         contract: new Address(treasuryContractId).toScAddress(),
-        key: xdr.ScVal.scvVec([
-          xdr.ScVal.scvSymbol('Transaction'),
-          xdr.ScVal.scvU32(0),
-        ]),
+        key: xdr.ScVal.scvLedgerKeyContractInstance(),
         durability: xdr.ContractDataDurability.persistent(),
       }),
     );
 
-    // Read TxCounter to learn how many proposals exist.
-    const counterKey = xdr.LedgerKey.contractData(
-      new xdr.LedgerKeyContractData({
-        contract: new Address(treasuryContractId).toScAddress(),
-        key: xdr.ScVal.scvSymbol('TxCounter'),
-        durability: xdr.ContractDataDurability.persistent(),
-      }),
-    );
-
-    const resp = await this.server.getLedgerEntries(counterKey);
+    const resp = await this.server.getLedgerEntries(contractKey);
     if (resp.entries.length === 0) return [];
 
-    const counterVal = scValToNative(resp.entries[0].val.contractData().val());
-    const txCount = typeof counterVal === 'bigint' ? Number(counterVal) : Number(counterVal);
+    const contractData = resp.entries[0].val.contractData();
+    const instance = contractData.val().instance();
+    const storage = instance.storage();
+
+    if (!storage) return [];
+
+    // Find TxCounter in instance storage
+    let txCount = 0;
+    for (const mapEntry of storage as any) {
+      const keyNative = scValToNative(typeof mapEntry.key === 'function' ? mapEntry.key() : mapEntry.key);
+      if (keyNative === 'TxCounter') {
+        const val = scValToNative(typeof mapEntry.val === 'function' ? mapEntry.val() : mapEntry.val);
+        txCount = typeof val === 'bigint' ? Number(val) : Number(val);
+        break;
+      }
+    }
+
+    if (txCount === 0) return [];
 
     const results: Array<{ proposalId: string; status: string }> = [];
     // Batch-read proposals (limit to 200 to avoid huge RPC payloads).
