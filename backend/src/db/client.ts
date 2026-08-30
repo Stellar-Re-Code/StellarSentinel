@@ -94,6 +94,82 @@ export class Db {
     `).all(contractId, limit, offset) as IndexedEventRow[];
   }
 
+  // ─── Vault schedules (issue #79) ─────────────────────────────────────────
+  // Order-aware, idempotent derived state for vault locks/vestings. Writes at
+  // a ledger older than the stored one are ignored so out-of-order delivery
+  // cannot roll correct state backwards.
+
+  upsertVaultSchedule(row: {
+    vault_id: string;
+    contract_id: string;
+    beneficiary: string;
+    total_amount: string;
+    ledger: number;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO vault_schedules (vault_id, contract_id, beneficiary, total_amount, claimed_amount, last_ledger)
+      VALUES (?, ?, ?, ?, '0', ?)
+      ON CONFLICT(vault_id, contract_id) DO UPDATE SET
+        beneficiary   = excluded.beneficiary,
+        total_amount  = excluded.total_amount,
+        last_ledger   = MAX(vault_schedules.last_ledger, excluded.last_ledger),
+        updated_at    = datetime('now')
+    `).run(row.vault_id, row.contract_id, row.beneficiary, row.total_amount, row.ledger);
+  }
+
+  applyVaultClaim(row: {
+    vault_id: string;
+    contract_id: string;
+    beneficiary?: string;
+    amount: string;
+    ledger: number;
+  }): void {
+    // A claim whose schedule row doesn't exist yet (out-of-order delivery)
+    // creates a placeholder so the amount is preserved; the late-arriving
+    // lock/vest fills in the totals without touching the claim history.
+    //
+    // BigInt addition is done application-side because SQLite CAST(... AS INTEGER)
+    // is limited to signed 64-bit while Stellar amounts are i128.
+    const existing = this.db.prepare(
+      `SELECT claimed_amount FROM vault_schedules WHERE vault_id = ? AND contract_id = ?`
+    ).get(row.vault_id, row.contract_id) as { claimed_amount: string } | undefined;
+    const newClaimed = (existing ? BigInt(existing.claimed_amount) : 0n) + BigInt(row.amount);
+    this.db.prepare(`
+      INSERT INTO vault_schedules (vault_id, contract_id, beneficiary, total_amount, claimed_amount, last_ledger)
+      VALUES (?, ?, ?, '0', ?, ?)
+      ON CONFLICT(vault_id, contract_id) DO UPDATE SET
+        claimed_amount = ?,
+        last_ledger = MAX(vault_schedules.last_ledger, excluded.last_ledger),
+        updated_at = datetime('now')
+        WHERE excluded.last_ledger >= vault_schedules.last_ledger
+    `).run(
+      row.vault_id,
+      row.contract_id,
+      row.beneficiary ?? '',
+      newClaimed.toString(),
+      row.ledger,
+      newClaimed.toString(),
+    );
+  }
+
+  getVaultSchedules(contractId: string): Array<{
+    vault_id: string; contract_id: string; beneficiary: string;
+    total_amount: string; claimed_amount: string; last_ledger: number;
+  }> {
+    return this.db.prepare(`
+      SELECT * FROM vault_schedules WHERE contract_id = ? ORDER BY vault_id ASC
+    `).all(contractId) as any[];
+  }
+
+  /** Non-terminal proposals — the ones a reconciler should verify on-chain. */
+  getOpenProposals(contractId: string): TreasuryProposalRow[] {
+    return this.db.prepare(`
+      SELECT * FROM treasury_proposals
+      WHERE contract_id = ? AND status NOT IN ('executed', 'canceled', 'expired')
+      ORDER BY ledger_proposed ASC
+    `).all(contractId) as TreasuryProposalRow[];
+  }
+
   // ─── Quarantine ───────────────────────────────────────────────────────────
 
   quarantineEvent(params: {
@@ -250,6 +326,12 @@ export class Db {
 
   getIndexerStatus(): IndexerStatusRow {
     return this.db.prepare('SELECT * FROM indexer_status WHERE id = 1').get() as IndexerStatusRow;
+  }
+
+  getReconciliationResults(limit = 50): ReconciliationResultRow[] {
+    return this.db.prepare(
+      'SELECT * FROM reconciliation_results ORDER BY id DESC LIMIT ?'
+    ).all(limit) as ReconciliationResultRow[];
   }
 
   haltIndexer(reason: string, ledger: number): void {

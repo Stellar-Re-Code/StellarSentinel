@@ -98,6 +98,21 @@ export function runMigrations(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_approvals_proposal ON treasury_approvals(proposal_id, contract_id);
     CREATE INDEX IF NOT EXISTS idx_balance_contract  ON treasury_balance_history(contract_id, ledger_sequence);
 
+    -- Issue #79: derived vault schedules so the reconciler can verify
+    -- indexed vault state (locks/vestings minus claims) against on-chain.
+    CREATE TABLE IF NOT EXISTS vault_schedules (
+        vault_id       TEXT    NOT NULL,
+        contract_id    TEXT    NOT NULL,
+        beneficiary    TEXT    NOT NULL,
+        total_amount   TEXT    NOT NULL,
+        claimed_amount TEXT    NOT NULL DEFAULT '0',
+        last_ledger    INTEGER NOT NULL,
+        updated_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (vault_id, contract_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_vault_schedules_contract ON vault_schedules(contract_id);
+
     CREATE TABLE IF NOT EXISTS indexer_status (
       id          INTEGER PRIMARY KEY CHECK (id = 1),
       halted      INTEGER NOT NULL DEFAULT 0,
