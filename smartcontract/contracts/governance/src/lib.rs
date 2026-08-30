@@ -4,9 +4,8 @@
 extern crate std;
 
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, contracterror, symbol_short,
+    contract, contractclient, contracterror, contractimpl, contracttype, log, symbol_short,
     Address, Env, Symbol, Vec,
-    log,
 };
 
 // Declared locally instead of importing access-control's / treasury's own
@@ -91,6 +90,8 @@ pub enum Error {
     ExecutionExpired = 14,
     /// The cross-contract call to execute the treasury withdrawal failed.
     FundingExecutionFailed = 15,
+    /// The page cursor or limit is outside the documented bounds.
+    InvalidPagination = 16,
 }
 
 // ============================================================================
@@ -196,6 +197,26 @@ pub struct Proposal {
     pub exec_deadline: u64,
 }
 
+/// A proposal together with lifecycle fields evaluated at the current ledger.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalRead {
+    pub proposal: Proposal,
+    /// Whether the voting deadline has passed while the proposal is unfinalized.
+    pub voting_ended: bool,
+    /// Whether a passed proposal can currently be submitted for execution.
+    pub execution_eligible: bool,
+}
+
+/// One bounded page of proposals, ordered by ascending proposal ID.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalPage {
+    pub proposals: Vec<ProposalRead>,
+    /// The cursor for the next page, or zero when this is the terminal page.
+    pub next_cursor: u64,
+}
+
 /// Governance configuration.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -266,15 +287,24 @@ impl GovernanceContract {
         env.storage()
             .instance()
             .set(&DataKey::ProposalCounter, &0_u64);
-        env.storage().instance().set(&DataKey::AclAddress, &acl_address);
-        env.storage().instance().set(&DataKey::TreasuryAddress, &treasury_address);
+        env.storage()
+            .instance()
+            .set(&DataKey::AclAddress, &acl_address);
+        env.storage()
+            .instance()
+            .set(&DataKey::TreasuryAddress, &treasury_address);
 
         env.events().publish(
             (symbol_short!("gov"), symbol_short!("init")),
             (admin.clone(), members.len(), quorum_percent),
         );
 
-        log!(&env, "Governance initialized: {} members, {}% quorum", members.len(), quorum_percent);
+        log!(
+            &env,
+            "Governance initialized: {} members, {}% quorum",
+            members.len(),
+            quorum_percent
+        );
         Ok(())
     }
 
@@ -366,12 +396,7 @@ impl GovernanceContract {
     /// * `voter` - Must be a DAO member.
     /// * `proposal_id` - The ID of the proposal to vote on.
     /// * `vote_for` - `true` to vote in favor, `false` to vote against.
-    pub fn vote(
-        env: Env,
-        voter: Address,
-        proposal_id: u64,
-        vote_for: bool,
-    ) -> Result<(), Error> {
+    pub fn vote(env: Env, voter: Address, proposal_id: u64, vote_for: bool) -> Result<(), Error> {
         Self::require_initialized(&env)?;
         Self::require_member(&env, &voter)?;
 
@@ -540,11 +565,7 @@ impl GovernanceContract {
     /// move, and the error is propagated to the caller — both contracts
     /// stay consistent and the proposal remains executable once the
     /// underlying condition is fixed (unless the deadline has passed).
-    pub fn execute_proposal(
-        env: Env,
-        executor: Address,
-        proposal_id: u64,
-    ) -> Result<(), Error> {
+    pub fn execute_proposal(env: Env, executor: Address, proposal_id: u64) -> Result<(), Error> {
         Self::require_initialized(&env)?;
 
         executor.require_auth();
@@ -596,8 +617,7 @@ impl GovernanceContract {
 
                 let cfg = Self::get_treasury_config(&env, &treasury_address)?;
 
-                let treasury_client =
-                    TreasuryClient::new(&env, &treasury_address);
+                let treasury_client = TreasuryClient::new(&env, &treasury_address);
 
                 match treasury_client.try_execute_governance_withdrawal(
                     &env.current_contract_address(),
@@ -698,6 +718,61 @@ impl GovernanceContract {
             .ok_or(Error::ProposalNotFound)
     }
 
+    /// List proposals in ascending ID order after `cursor`.
+    ///
+    /// `cursor` is the ID from the previous page (use zero for the first
+    /// page). `limit` must be between 1 and 25 inclusive. A cursor greater
+    /// than the current proposal count is invalid. `next_cursor` is zero when
+    /// the returned page is terminal.
+    pub fn list_proposals(env: Env, cursor: u64, limit: u32) -> Result<ProposalPage, Error> {
+        Self::require_initialized(&env)?;
+
+        const MAX_PAGE_SIZE: u32 = 25;
+        if limit == 0 || limit > MAX_PAGE_SIZE {
+            return Err(Error::InvalidPagination);
+        }
+
+        let proposal_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalCounter)
+            .unwrap_or(0);
+        if cursor > proposal_count {
+            return Err(Error::InvalidPagination);
+        }
+
+        let mut proposals = Vec::new(&env);
+        let mut proposal_id = cursor + 1;
+        while proposal_id <= proposal_count && proposals.len() < limit {
+            let proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Proposal(proposal_id))
+                .ok_or(Error::ProposalNotFound)?;
+            let voting_ended = proposal.status == ProposalStatus::Active
+                && env.ledger().sequence() > proposal.ends_at;
+            let execution_eligible = proposal.status == ProposalStatus::Passed
+                && (proposal.action != ProposalAction::Funding
+                    || env.ledger().timestamp() <= proposal.exec_deadline);
+            proposals.push_back(ProposalRead {
+                proposal,
+                voting_ended,
+                execution_eligible,
+            });
+            proposal_id += 1;
+        }
+
+        let next_cursor = if proposal_id <= proposal_count {
+            proposal_id - 1
+        } else {
+            0
+        };
+        Ok(ProposalPage {
+            proposals,
+            next_cursor,
+        })
+    }
+
     /// Get governance configuration.
     pub fn get_config(env: Env) -> Result<GovConfig, Error> {
         Self::require_initialized(&env)?;
@@ -769,9 +844,7 @@ impl GovernanceContract {
 
         Self::require_acl_admin_or_above(&env, &new_admin)?;
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Admin, &new_admin);
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
 
         env.events().publish(
             (symbol_short!("gov"), symbol_short!("admin")),
@@ -792,10 +865,8 @@ impl GovernanceContract {
             .instance()
             .set(&DataKey::QuorumPercent, &new_quorum);
 
-        env.events().publish(
-            (symbol_short!("gov"), symbol_short!("quorum")),
-            new_quorum,
-        );
+        env.events()
+            .publish((symbol_short!("gov"), symbol_short!("quorum")), new_quorum);
 
         Ok(())
     }
@@ -921,7 +992,13 @@ mod test {
         acl_client.assign_role(admin, target, role);
     }
 
-    fn setup_contract() -> (Env, Address, Address, Address, GovernanceContractClient<'static>) {
+    fn setup_contract() -> (
+        Env,
+        Address,
+        Address,
+        Address,
+        GovernanceContractClient<'static>,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, GovernanceContract);
@@ -956,10 +1033,7 @@ mod test {
         let member1 = Address::generate(&env);
         let member2 = Address::generate(&env);
         let member3 = Address::generate(&env);
-        let members = Vec::from_array(
-            &env,
-            [member1.clone(), member2.clone(), member3.clone()],
-        );
+        let members = Vec::from_array(&env, [member1.clone(), member2.clone(), member3.clone()]);
 
         assign_role(&env, &acl_id, &admin, &member1, &Role::Member);
         assign_role(&env, &acl_id, &admin, &member2, &Role::Member);
@@ -1013,6 +1087,120 @@ mod test {
         client.vote(&member1, &proposal_id, &true);
 
         assert_eq!(client.has_voted(&proposal_id, &member1), true);
+    }
+
+    #[test]
+    fn test_list_proposals_pages_without_gaps_or_duplicates() {
+        let (env, admin, acl_id, treasury_id, client) = setup_contract();
+        let member = Address::generate(&env);
+        let second_member = Address::generate(&env);
+        let members = Vec::from_array(&env, [member.clone(), second_member.clone()]);
+        assign_role(&env, &acl_id, &admin, &member, &Role::Member);
+        assign_role(&env, &acl_id, &admin, &second_member, &Role::Member);
+        client.initialize(&admin, &members, &50, &1000, &acl_id, &treasury_id);
+
+        assert!(client.list_proposals(&0, &1).proposals.is_empty());
+        for _ in 0..3 {
+            client.create_proposal(
+                &member,
+                &symbol_short!("page"),
+                &symbol_short!("page"),
+                &ProposalAction::General,
+                &0,
+                &member,
+            );
+        }
+
+        let first = client.list_proposals(&0, &2);
+        assert_eq!(first.proposals.len(), 2);
+        assert_eq!(first.proposals.get(0).unwrap().proposal.id, 1);
+        assert_eq!(first.proposals.get(1).unwrap().proposal.id, 2);
+        assert_eq!(first.next_cursor, 2);
+
+        let last = client.list_proposals(&first.next_cursor, &2);
+        assert_eq!(last.proposals.len(), 1);
+        assert_eq!(last.proposals.get(0).unwrap().proposal.id, 3);
+        assert_eq!(last.next_cursor, 0);
+        assert!(client.list_proposals(&3, &1).proposals.is_empty());
+        assert_eq!(
+            client.try_list_proposals(&4, &1),
+            Err(Ok(Error::InvalidPagination))
+        );
+        assert_eq!(
+            client.try_list_proposals(&0, &0),
+            Err(Ok(Error::InvalidPagination))
+        );
+        assert_eq!(
+            client.try_list_proposals(&0, &26),
+            Err(Ok(Error::InvalidPagination))
+        );
+    }
+
+    #[test]
+    fn test_list_proposals_exposes_terminal_and_expired_voting_states() {
+        let (env, admin, acl_id, treasury_id, client) = setup_contract();
+        let member = Address::generate(&env);
+        let second_member = Address::generate(&env);
+        let members = Vec::from_array(&env, [member.clone(), second_member.clone()]);
+        assign_role(&env, &acl_id, &admin, &member, &Role::Member);
+        assign_role(&env, &acl_id, &admin, &second_member, &Role::Member);
+        client.initialize(&admin, &members, &50, &1000, &acl_id, &treasury_id);
+
+        let passed = client.create_proposal(
+            &member,
+            &symbol_short!("pass"),
+            &symbol_short!("pass"),
+            &ProposalAction::General,
+            &0,
+            &member,
+        );
+        let rejected = client.create_proposal(
+            &member,
+            &symbol_short!("reject"),
+            &symbol_short!("reject"),
+            &ProposalAction::General,
+            &0,
+            &member,
+        );
+        let expired = client.create_proposal(
+            &member,
+            &symbol_short!("expire"),
+            &symbol_short!("expire"),
+            &ProposalAction::General,
+            &0,
+            &member,
+        );
+        client.vote(&member, &passed, &true);
+        client.vote(&member, &rejected, &false);
+        env.ledger()
+            .with_mut(|ledger| ledger.sequence_number += 1001);
+
+        let before_finalize = client.list_proposals(&2, &1).proposals.get(0).unwrap();
+        assert!(before_finalize.voting_ended);
+        assert!(!before_finalize.execution_eligible);
+        assert_eq!(client.finalize(&member, &passed), ProposalStatus::Passed);
+        assert_eq!(
+            client.finalize(&member, &rejected),
+            ProposalStatus::Rejected
+        );
+        assert_eq!(client.finalize(&member, &expired), ProposalStatus::Expired);
+
+        let passed_read = client.list_proposals(&0, &1).proposals.get(0).unwrap();
+        assert!(passed_read.execution_eligible);
+        client.execute_proposal(&member, &passed);
+        let page = client.list_proposals(&0, &25);
+        assert_eq!(
+            page.proposals.get(0).unwrap().proposal.status,
+            ProposalStatus::Executed
+        );
+        assert_eq!(
+            page.proposals.get(1).unwrap().proposal.status,
+            ProposalStatus::Rejected
+        );
+        assert_eq!(
+            page.proposals.get(2).unwrap().proposal.status,
+            ProposalStatus::Expired
+        );
     }
 
     // ========================================================================
@@ -1095,8 +1283,14 @@ mod test {
         );
         assert_eq!(
             treasury.try_execute_governance_withdrawal(
-                &gov.address, &treasury.address, &pid, &recipient, &asset,
-                &250_000, &proposal.policy_version, &proposal.exec_deadline,
+                &gov.address,
+                &treasury.address,
+                &pid,
+                &recipient,
+                &asset,
+                &250_000,
+                &proposal.policy_version,
+                &proposal.exec_deadline,
             ),
             Err(Ok(stellar_sentinel_treasury::Error::AuthorizationReplayed))
         );

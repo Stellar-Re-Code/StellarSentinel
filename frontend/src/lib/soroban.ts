@@ -16,6 +16,7 @@ import { SOROBAN_RPC_URL, NETWORK_PASSPHRASE } from "./network";
 
 export const CONTRACT_IDS = {
   treasury: process.env.NEXT_PUBLIC_TREASURY_CONTRACT_ID || "CD2M7R6E55D36VTR2C5BIPNGB6W6KUX5IAJTGKIN2ER7LBNVKOCCWAAA", // Example testnet ID
+  governance: process.env.NEXT_PUBLIC_GOVERNANCE_CONTRACT_ID || "",
 } as const;
 
 // ============================================================================
