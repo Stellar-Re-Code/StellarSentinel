@@ -91,6 +91,7 @@ fn governance_membership_lifecycle_updates_authorization() {
         &newbie,
     );
     gov.vote(&members[0], &add, &true);
+    gov.vote(&members[1], &add, &true);
     advance_seq(&env, 100);
     assert_eq!(gov.finalize(&members[0], &add), ProposalStatus::Passed);
     gov.execute_proposal(&admin, &add);
@@ -116,6 +117,7 @@ fn governance_membership_lifecycle_updates_authorization() {
         &members[1],
     );
     gov.vote(&members[0], &rem, &true);
+    gov.vote(&members[2], &rem, &true);
     advance_seq(&env, 100);
     assert_eq!(gov.finalize(&members[0], &rem), ProposalStatus::Passed);
     gov.execute_proposal(&admin, &rem);
@@ -175,6 +177,7 @@ fn terminal_operations_cannot_replay_across_contracts() {
         &gmembers[0],
     );
     gov.vote(&gmembers[0], &pid, &true);
+    gov.vote(&gmembers[1], &pid, &true);
     advance_seq(&env, 100);
     gov.finalize(&gmembers[0], &pid);
     gov.execute_proposal(&admin, &pid);
