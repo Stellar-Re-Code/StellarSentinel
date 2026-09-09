@@ -498,7 +498,12 @@ impl GovernanceContract {
             .get(&DataKey::QuorumPercent)
             .unwrap_or(50);
 
-        let quorum_threshold = (members.len() * quorum_percent) / 100;
+        let quorum_threshold = members
+            .len()
+            .checked_mul(quorum_percent)
+            .and_then(|votes| votes.checked_add(99))
+            .ok_or(Error::InvalidProposal)?
+            / 100;
         if proposal.total_votes < quorum_threshold {
             proposal.status = ProposalStatus::Expired;
         } else if proposal.votes_for > proposal.votes_against {

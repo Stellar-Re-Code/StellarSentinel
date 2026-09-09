@@ -96,6 +96,17 @@ fn quorum_not_met_expires() {
     );
 }
 
+/// INV-G4: quorum rounds up so a 50% quorum in a three-member DAO needs two votes.
+#[test]
+fn quorum_rounds_up_for_non_divisible_member_counts() {
+    let (env, _admin, members, c) = setup(3, 50, 100);
+    let id = mk_proposal(&c, &members[0]);
+    c.vote(&members[0], &id, &true);
+
+    advance_seq(&env, 200);
+    assert_eq!(c.finalize(&members[0], &id), ProposalStatus::Expired);
+}
+
 /// INV-G4: voting is closed once the proposal is finalized.
 #[test]
 fn cannot_vote_after_finalize() {
