@@ -2,7 +2,17 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { useFreighter, MockSigner } from "@/context/FreighterProvider";
-import { buildContractCall, signAndSubmit, readContractValue, CONTRACT_IDS } from "@/lib/soroban";
+import { 
+  buildContractCall, 
+  signAndSubmit, 
+  readContractValue, 
+  CONTRACT_IDS,
+  encodeAddress,
+  encodeI128,
+  encodeU32,
+  encodeU64,
+  encodeString
+} from "@/lib/soroban";
 import { Address } from "@stellar/stellar-sdk";
 
 // ============================================================================
@@ -192,7 +202,7 @@ export function useTreasury() {
       const txsList: TreasuryTransaction[] = [];
       for (let i = 1; i <= activeConfig.txCount; i++) {
         try {
-          const txVal = await readContractValue(CONTRACT_IDS.treasury, "get_transaction", [i]);
+          const txVal = await readContractValue<any>(CONTRACT_IDS.treasury, "get_transaction", [encodeU32(i)]);
           if (txVal) {
             txsList.push({
               id: Number(txVal.id),
@@ -245,7 +255,7 @@ export function useTreasury() {
 
     // Live mode
     if (!address) throw new Error("Wallet not connected");
-    const xdr = await buildContractCall(CONTRACT_IDS.treasury, "deposit", [address, stroops], address);
+    const xdr = await buildContractCall(CONTRACT_IDS.treasury, "deposit", [encodeAddress(address), encodeI128(stroops)], address);
     await signAndSubmit(xdr, address);
     await refresh();
   };
@@ -300,7 +310,13 @@ export function useTreasury() {
     const xdr = await buildContractCall(
       CONTRACT_IDS.treasury,
       "propose_withdrawal",
-      [address, to, stroops, memo, expiresAt],
+      [
+        encodeAddress(address),
+        encodeAddress(to),
+        encodeI128(stroops),
+        encodeString(memo || "Withdrawal Proposal"),
+        encodeU64(expiresAt),
+      ],
       address
     );
     const hash = await signAndSubmit(xdr, address);
@@ -340,7 +356,7 @@ export function useTreasury() {
     }
 
     // Live Mode
-    const xdr = await buildContractCall(CONTRACT_IDS.treasury, "approve", [address, txId], address);
+    const xdr = await buildContractCall(CONTRACT_IDS.treasury, "approve", [encodeAddress(address), encodeU32(txId)], address);
     await signAndSubmit(xdr, address);
     await refresh();
   };
@@ -374,7 +390,7 @@ export function useTreasury() {
     }
 
     // Live Mode
-    const xdr = await buildContractCall(CONTRACT_IDS.treasury, "revoke_approval", [address, txId], address);
+    const xdr = await buildContractCall(CONTRACT_IDS.treasury, "revoke_approval", [encodeAddress(address), encodeU32(txId)], address);
     await signAndSubmit(xdr, address);
     await refresh();
   };
@@ -409,7 +425,7 @@ export function useTreasury() {
     }
 
     // Live Mode
-    const xdr = await buildContractCall(CONTRACT_IDS.treasury, "cancel_withdrawal", [address, txId], address);
+    const xdr = await buildContractCall(CONTRACT_IDS.treasury, "cancel_withdrawal", [encodeAddress(address), encodeU32(txId)], address);
     await signAndSubmit(xdr, address);
     await refresh();
   };
@@ -457,7 +473,7 @@ export function useTreasury() {
     }
 
     // Live Mode
-    const xdr = await buildContractCall(CONTRACT_IDS.treasury, "execute", [address, txId], address);
+    const xdr = await buildContractCall(CONTRACT_IDS.treasury, "execute", [encodeAddress(address), encodeU32(txId)], address);
     await signAndSubmit(xdr, address);
     await refresh();
   };
