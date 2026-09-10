@@ -2,10 +2,10 @@ import {
   Contract, 
   SorobanRpc, 
   TransactionBuilder, 
-  Networks, 
   xdr, 
   Address,
-  nativeToScVal
+  nativeToScVal,
+  scValToNative
 } from "@stellar/stellar-sdk";
 import { signTransaction } from "@stellar/freighter-api";
 import { SOROBAN_RPC_URL, NETWORK_PASSPHRASE } from "./network";
@@ -15,9 +15,47 @@ import { SOROBAN_RPC_URL, NETWORK_PASSPHRASE } from "./network";
 // ============================================================================
 
 export const CONTRACT_IDS = {
-  treasury: process.env.NEXT_PUBLIC_TREASURY_CONTRACT_ID || "CD2M7R6E55D36VTR2C5BIPNGB6W6KUX5IAJTGKIN2ER7LBNVKOCCWAAA", // Example testnet ID
+  treasury: process.env.NEXT_PUBLIC_TREASURY_CONTRACT_ID || "",
   governance: process.env.NEXT_PUBLIC_GOVERNANCE_CONTRACT_ID || "",
 } as const;
+
+/**
+ * Validate that a contract ID is configured and not an example/placeholder.
+ */
+export function validateContractId(contractId: string, name: string = "Contract"): void {
+  if (
+    !contractId ||
+    contractId.trim().length === 0 ||
+    contractId.includes("PLACEHOLDER") ||
+    contractId === "CD2M7R6E55D36VTR2C5BIPNGB6W6KUX5IAJTGKIN2ER7LBNVKOCCWAAA"
+  ) {
+    throw new Error(`${name} contract ID is not configured. Live mode requires an active Soroban deployment.`);
+  }
+}
+
+// ============================================================================
+// Soroban Type Encoding Helpers
+// ============================================================================
+
+export function encodeAddress(addr: string): xdr.ScVal {
+  return new Address(addr).toScVal();
+}
+
+export function encodeI128(val: number | bigint | string): xdr.ScVal {
+  return nativeToScVal(BigInt(val), { type: "i128" });
+}
+
+export function encodeU32(val: number): xdr.ScVal {
+  return nativeToScVal(val, { type: "u32" });
+}
+
+export function encodeU64(val: number | bigint): xdr.ScVal {
+  return nativeToScVal(BigInt(val), { type: "u64" });
+}
+
+export function encodeString(val: string): xdr.ScVal {
+  return nativeToScVal(val, { type: "string" });
+}
 
 // ============================================================================
 // Soroban RPC Helpers
@@ -31,14 +69,16 @@ export function getRpcServer(): SorobanRpc.Server {
 }
 
 /**
- * Build a Soroban contract invocation transaction.
+ * Build a Soroban contract invocation transaction with typed ScVal arguments
+ * and filtered authorization entries.
  */
 export async function buildContractCall(
   contractId: string,
   method: string,
-  args: any[],
+  args: xdr.ScVal[],
   sourceAddress: string
 ): Promise<string> {
+  validateContractId(contractId, "Treasury");
   const server = getRpcServer();
   const account = await server.getAccount(sourceAddress);
   const contract = new Contract(contractId);
@@ -54,6 +94,29 @@ export async function buildContractCall(
   const simulated = await server.simulateTransaction(tx);
   if (SorobanRpc.Api.isSimulationError(simulated)) {
     throw new Error(`Simulation failed: ${simulated.error}`);
+  }
+
+  // Filter authorization entries to connected account
+  const authEntries = (simulated as any).auth || [];
+  if (authEntries.length > 0) {
+    const isAuthorized = authEntries.every((entry: any) => {
+      try {
+        const credentials = entry.credentials();
+        if (credentials.switch().name === "sorobanCredentialsAddress") {
+          const addr = Address.fromScAddress(credentials.address().address()).toString();
+          return addr.toLowerCase() === sourceAddress.toLowerCase();
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    });
+
+    if (!isAuthorized) {
+      throw new Error(
+        `Transaction simulation requested unauthorized signers beyond the connected account (${sourceAddress}). Authorization rejected.`
+      );
+    }
   }
   
   const assembledTx = SorobanRpc.assembleTransaction(tx, simulated) as any;
@@ -97,17 +160,17 @@ export async function signAndSubmit(
 }
 
 /**
- * Read a value from a Soroban contract (no signing required).
+ * Read a value from a Soroban contract and decode return XDR into native application data.
  */
-export async function readContractValue(
+export async function readContractValue<T = any>(
   contractId: string,
   method: string,
-  args: any[] = []
-): Promise<any> {
+  args: xdr.ScVal[] = []
+): Promise<T | null> {
+  validateContractId(contractId, "Treasury");
   const server = getRpcServer();
   const contract = new Contract(contractId);
   
-  // Use a dummy source address for simulation
   const dummySource = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
   const account = await server.getAccount(dummySource);
   
@@ -124,9 +187,8 @@ export async function readContractValue(
     throw new Error(`Simulation failed: ${simulated.error}`);
   }
 
-  if (simulated.result) {
-    // Return parsed result if available
-    return simulated.result.retval;
+  if (simulated.result?.retval) {
+    return scValToNative(simulated.result.retval) as T;
   }
   return null;
 }
